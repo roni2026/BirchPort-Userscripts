@@ -3,7 +3,7 @@
 // @namespace    userscript-req-supplier-fix
 // @version      2.0
 // @description  Scans a requisition page, shows live per-line status, and reassigns any line item not on the target supplier to that supplier automatically.
-// @match        https://YOUR-PROCUREMENT-DOMAIN/*
+// @match        https://*.birchstreetsystems.com/*
 // @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
@@ -12,9 +12,12 @@
   'use strict';
 
   // ------------------------------------------------------------------
-  // EDIT THIS: change the @match line above to your actual procurement
-  // domain (e.g. https://yourcompany.birchstreet.net/*), otherwise the
-  // script will never load on the page.
+  // @match is set to https://*.birchstreetsystems.com/* so it works no
+  // matter which app node (app01, app02, app03, …) you land on. The
+  // popup windows (Edit Line / Change Supp / supplier list) are same-
+  // origin under this domain too, so they don't need their own @match
+  // entry - the script controls them directly via captured window
+  // handles.
   // ------------------------------------------------------------------
 
   const uw = unsafeWindow;
