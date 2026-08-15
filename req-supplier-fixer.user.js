@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         REQ Supplier Auto-Fixer
 // @namespace    userscript-req-supplier-fix
-// @version      2.2
-// @description  Scans a requisition page and reassigns line item(s) to a target supplier, optionally filtered to specific item SKU(s).
+// @version      3.0
+// @description  Scans a requisition page and reassigns line item(s) to a target supplier, optionally filtered to specific item SKU(s). Adds confirmation, dry-run, change cap, and audit log.
 // @match        https://*.birchstreetsystems.com/*
 // @grant        unsafeWindow
 // @run-at       document-idle
@@ -98,11 +98,15 @@
   // there's nothing left to fix.
   // ------------------------------------------------------------------
   const RESUME_KEY = 'rsf_resume_state_v1';
+  const LOG_KEY = 'rsf_audit_log_v1';
   const RESUME_MAX_AGE_MS = 3 * 60 * 1000; // ignore stale flags from abandoned runs
 
-  function saveResumeState(targetId, skuFilters) {
+  function saveResumeState(targetId, skuFilters, maxLines, remainingBudget) {
     try {
-      sessionStorage.setItem(RESUME_KEY, JSON.stringify({ targetId, skuFilters: skuFilters || [], ts: Date.now() }));
+      sessionStorage.setItem(
+        RESUME_KEY,
+        JSON.stringify({ targetId, skuFilters: skuFilters || [], maxLines, remainingBudget, ts: Date.now() })
+      );
     } catch (e) {
       /* ignore storage errors */
     }
@@ -129,6 +133,39 @@
       return parsed;
     } catch (e) {
       return null;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Audit log - persisted in sessionStorage so entries survive the page
+  // reloads that happen mid-run (see resume-state note above). This is a
+  // record of what the script did, not an undo mechanism.
+  // ------------------------------------------------------------------
+  function loadLog() {
+    try {
+      const raw = sessionStorage.getItem(LOG_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function appendLog(entry) {
+    try {
+      const log = loadLog();
+      log.push(Object.assign({ time: new Date().toISOString() }, entry));
+      sessionStorage.setItem(LOG_KEY, JSON.stringify(log));
+      return log;
+    } catch (e) {
+      return loadLog();
+    }
+  }
+
+  function clearLogStorage() {
+    try {
+      sessionStorage.removeItem(LOG_KEY);
+    } catch (e) {
+      /* ignore */
     }
   }
 
@@ -218,6 +255,12 @@
     return m ? m[0] : '';
   }
 
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+  }
+
   // ---------- REQ page parsing ----------
 
   // Collect { line, reqNumber, supplierId, supplierName, sku, link } for
@@ -285,6 +328,7 @@
       await sleep(200);
       if (!editWin.closed) editWin.close();
       ui.setStatus(item.line, 'not_found', `Supplier "${targetId}" not offered for this item`);
+      appendLog({ line: item.line, sku: item.sku, from: item.supplierId, to: targetId, status: 'not_found' });
       return;
     }
 
@@ -300,6 +344,7 @@
       await sleep(200);
       if (!editWin.closed) editWin.close();
       ui.setStatus(item.line, 'error', 'Could not find the radio button for the matched supplier row');
+      appendLog({ line: item.line, sku: item.sku, from: item.supplierId, to: targetId, status: 'error', note: 'radio not found' });
       return;
     }
     radio.click();
@@ -347,6 +392,7 @@
     // handles: the next page load picks the run back up automatically. Any
     // code below this point is best-effort only for the rare case Save
     // doesn't trigger that reload.
+    const originalSupplierId = item.supplierId;
     editWin.document.getElementById('okclick').click(); // "Save"
     await waitForClosed(() => editWin).catch(() => {
       if (!editWin.closed) editWin.close();
@@ -355,16 +401,19 @@
     await sleep(500);
     if (verifyLineSupplier(item, targetId)) {
       ui.setStatus(item.line, 'success', `Changed to ${targetId} (verified)`);
+      appendLog({ line: item.line, sku: item.sku, from: originalSupplierId, to: targetId, status: 'verified' });
     } else {
       ui.setStatus(item.line, 'saved', `Saved — page should reload shortly to confirm`);
+      appendLog({ line: item.line, sku: item.sku, from: originalSupplierId, to: targetId, status: 'saved_unverified' });
     }
   }
 
   // ---------- orchestration ----------
 
-  async function run(targetId, skuFilters, ui) {
+  async function run(targetId, skuFilters, maxLines, dryRun, ui, budgetOverride) {
     running = true;
     stopRequested = false;
+    ui.setRunningState(true);
 
     const allItems = scanReqLines();
     const items = skuFilters && skuFilters.length
@@ -373,9 +422,10 @@
 
     if (skuFilters && skuFilters.length && items.length === 0) {
       ui.renderRows([]);
-      ui.setSummary(`No line(s) found matching SKU(s): ${skuFilters.join(', ')}`);
+      ui.setSummary(`No line(s) found matching SKU(s): ${skuFilters.join(', ')}`, 'warn');
       clearResumeState();
       running = false;
+      ui.setRunningState(false);
       return;
     }
 
@@ -393,21 +443,51 @@
 
     if (toFix.length === 0) {
       clearResumeState();
-      ui.setSummary(`All matching line(s) already on ${targetId}. Finished.`);
+      ui.setSummary(`All matching line(s) already on ${targetId}. Nothing to do.`, 'ok');
       running = false;
+      ui.setRunningState(false);
+      return;
+    }
+
+    // Safety cap: refuse to silently blow past the line budget the user
+    // approved. If more lines need changing than the cap allows, only the
+    // first N (by budget) are queued and the rest are left untouched with
+    // a clear "over cap" status so nothing is changed without the user
+    // explicitly raising the limit.
+    const budget = typeof budgetOverride === 'number' ? budgetOverride : maxLines;
+    const queued = toFix.slice(0, budget);
+    const overCap = toFix.slice(budget);
+    overCap.forEach((it) => ui.setStatus(it.line, 'capped', `Skipped — over the ${maxLines}-line cap for this run`));
+
+    if (dryRun) {
+      queued.forEach((it) => ui.setStatus(it.line, 'would_change', `Would change ${it.supplierId} → ${targetId}`));
+      clearResumeState();
+      ui.setSummary(
+        `Dry run: ${queued.length} of ${items.length} line(s) would change to ${targetId}.` +
+        (overCap.length ? ` ${overCap.length} more exceed the ${maxLines}-line cap.` : '') +
+        ' No changes were made.',
+        'info'
+      );
+      running = false;
+      ui.setRunningState(false);
       return;
     }
 
     // Remember what we're doing BEFORE we touch anything that could trigger
     // a save - saving a line reloads this page out from under the script,
-    // so this flag is what lets the next page load pick back up.
-    saveResumeState(targetId, skuFilters);
+    // so this flag is what lets the next page load pick back up. We store
+    // the remaining budget so a resumed run can't exceed the cap the user
+    // originally approved.
+    saveResumeState(targetId, skuFilters, maxLines, budget);
     ui.setSummary(
-      `${toFix.length} of ${items.length} line(s) need changing to ${targetId}. ` +
-      `Note: this page reloads after each save - leave the tab open, the panel resumes itself.`
+      `${queued.length} of ${items.length} line(s) changing to ${targetId}` +
+      (overCap.length ? ` (${overCap.length} over the ${maxLines}-line cap, skipped)` : '') +
+      '. This page reloads after each save — leave the tab open, the panel resumes itself.',
+      'info'
     );
 
-    for (const item of toFix) {
+    let remaining = budget;
+    for (const item of queued) {
       if (stopRequested) {
         ui.setStatus(item.line, 'pending', 'Stopped before running');
         continue;
@@ -416,7 +496,10 @@
         await fixLine(item, targetId, ui);
       } catch (e) {
         ui.setStatus(item.line, 'error', e.message);
+        appendLog({ line: item.line, sku: item.sku, from: item.supplierId, to: targetId, status: 'error', note: e.message });
       }
+      remaining -= 1;
+      saveResumeState(targetId, skuFilters, maxLines, remaining);
       await sleep(400);
     }
 
@@ -424,43 +507,272 @@
     // remaining items all hit not_found/error) or we finished naturally -
     // either way there's nothing left to resume.
     clearResumeState();
-    ui.setSummary(stopRequested ? 'Stopped.' : 'Finished.');
+    ui.setSummary(stopRequested ? 'Stopped by user.' : 'Finished.', stopRequested ? 'warn' : 'ok');
     running = false;
+    ui.setRunningState(false);
   }
 
   // ---------- floating control panel ----------
 
   const STATUS_STYLES = {
-    match:      { icon: '✅', color: '#1a7f37', bg: '#eafbea' },
-    pending:    { icon: '⏳', color: '#666', bg: '#f2f2f2' },
-    processing: { icon: '🔄', color: '#0969da', bg: '#eaf2fe' },
-    success:    { icon: '✅', color: '#1a7f37', bg: '#eafbea' },
-    saved:      { icon: '💾', color: '#0969da', bg: '#eaf2fe' },
-    not_found:  { icon: '⚠️', color: '#9a6700', bg: '#fff6e0' },
-    error:      { icon: '❌', color: '#cf222e', bg: '#ffecec' },
+    match:        { icon: '✓', label: 'OK',      color: '#1a7f37', bg: '#eafbea' },
+    pending:      { icon: '…', label: 'Queued',  color: '#57606a', bg: '#f3f4f6' },
+    processing:   { icon: '↻', label: 'Working', color: '#0969da', bg: '#eaf2fe' },
+    success:      { icon: '✓', label: 'Done',    color: '#1a7f37', bg: '#eafbea' },
+    saved:        { icon: '⤓', label: 'Saved',   color: '#0969da', bg: '#eaf2fe' },
+    not_found:    { icon: '!', label: 'Not offered', color: '#9a6700', bg: '#fff6e0' },
+    error:        { icon: '✕', label: 'Error',   color: '#cf222e', bg: '#ffecec' },
+    capped:       { icon: '⊘', label: 'Capped',  color: '#9a6700', bg: '#fff6e0' },
+    would_change: { icon: '→', label: 'Preview', color: '#8250df', bg: '#f5eeff' },
   };
 
-  function buildUI() {
-    const box = document.createElement('div');
-    box.style.cssText =
-      'position:fixed;top:10px;right:10px;z-index:999999;background:#fff;border:1px solid #333;' +
-      'padding:10px;font:12px arial;width:340px;box-shadow:0 2px 8px rgba(0,0,0,.3);border-radius:6px;';
-    box.innerHTML = `
-      <div style="font-weight:bold;margin-bottom:6px;">REQ Supplier Fixer</div>
-      <input id="rsf-supplier" placeholder="Supplier ID or name e.g. 2917 or Chef 2 Chef" style="width:100%;margin-bottom:6px;box-sizing:border-box;">
-      <input id="rsf-sku" placeholder="Item SKU(s), comma-separated (blank = all lines)" style="width:100%;margin-bottom:6px;box-sizing:border-box;">
-      <div style="margin-bottom:6px;">
-        <button id="rsf-start" style="margin-right:6px;">Start</button>
-        <button id="rsf-stop">Stop</button>
-      </div>
-      <div id="rsf-summary" style="margin-bottom:4px;color:#444;font-style:italic;"></div>
-      <div id="rsf-rows" style="max-height:320px;overflow:auto;border-top:1px solid #ddd;padding-top:4px;"></div>
-    `;
-    document.body.appendChild(box);
+  const SUMMARY_STYLES = {
+    info: { color: '#0969da', bg: '#eaf2fe' },
+    ok:   { color: '#1a7f37', bg: '#eafbea' },
+    warn: { color: '#9a6700', bg: '#fff6e0' },
+    err:  { color: '#cf222e', bg: '#ffecec' },
+  };
 
-    const rowsDiv = box.querySelector('#rsf-rows');
-    const summaryDiv = box.querySelector('#rsf-summary');
+  function injectStyles() {
+    if (document.getElementById('rsf-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'rsf-styles';
+    style.textContent = `
+      #rsf-panel {
+        position: fixed; top: 16px; right: 16px; z-index: 999999;
+        width: 380px; max-width: calc(100vw - 32px);
+        background: #ffffff; color: #1f2328;
+        border: 1px solid #d0d7de; border-radius: 10px;
+        box-shadow: 0 8px 24px rgba(140,149,159,0.3), 0 1px 3px rgba(0,0,0,0.1);
+        font: 12.5px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        overflow: hidden;
+      }
+      #rsf-header {
+        display: flex; align-items: center; justify-content: space-between;
+        background: #24292f; color: #fff; padding: 10px 12px; cursor: move; user-select: none;
+      }
+      #rsf-header .rsf-title { font-weight: 600; font-size: 13px; display:flex; align-items:center; gap:6px; }
+      #rsf-header .rsf-dot { width:7px; height:7px; border-radius:50%; background:#8b949e; display:inline-block; }
+      #rsf-header .rsf-dot.on { background:#3fb950; }
+      #rsf-header button {
+        background: transparent; border: none; color: #d0d7de; cursor: pointer;
+        font-size: 14px; padding: 2px 6px; border-radius: 4px; line-height:1;
+      }
+      #rsf-header button:hover { background: rgba(255,255,255,0.15); color:#fff; }
+      #rsf-body { padding: 12px; }
+      #rsf-panel.rsf-collapsed #rsf-body { display: none; }
+      .rsf-field { margin-bottom: 8px; }
+      .rsf-field label { display:block; font-weight:600; margin-bottom:3px; color:#57606a; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
+      .rsf-field input[type="text"], .rsf-field input:not([type]) {
+        width: 100%; box-sizing: border-box; padding: 6px 8px;
+        border: 1px solid #d0d7de; border-radius: 6px; font-size: 12.5px;
+      }
+      .rsf-field input:focus { outline: none; border-color:#0969da; box-shadow:0 0 0 3px rgba(9,105,218,0.15); }
+      .rsf-row2 { display:flex; gap:8px; }
+      .rsf-row2 > div { flex: 1; }
+      .rsf-checkline { display:flex; align-items:center; gap:6px; margin: 8px 0; }
+      .rsf-checkline label { font-size: 12px; color:#1f2328; }
+      #rsf-btnrow { display: flex; gap: 8px; margin-top: 4px; margin-bottom: 8px; }
+      #rsf-btnrow button {
+        flex: 1; padding: 7px 10px; border-radius: 6px; border: 1px solid transparent;
+        font-size: 12.5px; font-weight: 600; cursor: pointer;
+      }
+      #rsf-start { background: #1f883d; color: #fff; }
+      #rsf-start:hover:not(:disabled) { background: #1a7f37; }
+      #rsf-start:disabled { background:#94d3a2; cursor:not-allowed; }
+      #rsf-stop { background: #fff; color: #cf222e; border-color: #d0d7de; }
+      #rsf-stop:hover:not(:disabled) { background: #ffecec; border-color:#cf222e; }
+      #rsf-stop:disabled { color:#c9c9c9; cursor:not-allowed; }
+      #rsf-summary {
+        padding: 7px 9px; border-radius: 6px; margin-bottom: 8px; font-size: 12px;
+        display: none;
+      }
+      #rsf-rows { max-height: 280px; overflow: auto; border-top: 1px solid #eaeef2; padding-top: 6px; }
+      .rsf-row { display:flex; align-items:flex-start; gap:8px; padding:5px 6px; border-radius:6px; margin-bottom:3px; }
+      .rsf-row .rsf-icon {
+        flex: none; width:18px; height:18px; border-radius:50%;
+        display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:700;
+        color:#fff;
+      }
+      .rsf-row .rsf-main { flex:1; min-width:0; }
+      .rsf-row .rsf-line { font-weight:600; }
+      .rsf-row .rsf-sub { font-size:11px; color:#57606a; }
+      .rsf-row .rsf-status-text { font-size:11px; margin-top:1px; }
+      #rsf-log-toggle { font-size: 11px; color:#0969da; cursor:pointer; text-decoration: underline; background:none; border:none; padding:0; margin-top:6px; }
+      #rsf-log { max-height: 140px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; background:#f6f8fa; border-radius:6px; padding:6px; margin-top:6px; display:none; white-space:pre-wrap; }
+      #rsf-log.rsf-log-open { display:block; }
+      .rsf-hint { font-size: 11px; color: #6e7781; margin-top: 2px; }
+      .rsf-resume-banner { background:#fff6e0; color:#9a6700; border:1px solid #eac54f; border-radius:6px; padding:6px 8px; font-size:11.5px; margin-bottom:8px; }
+
+      /* Confirmation overlay */
+      #rsf-confirm-overlay {
+        position: fixed; inset: 0; background: rgba(31,35,40,0.5); z-index: 1000000;
+        display: flex; align-items: center; justify-content: center;
+      }
+      #rsf-confirm-box {
+        background: #fff; border-radius: 10px; width: 360px; max-width: calc(100vw - 40px);
+        box-shadow: 0 12px 32px rgba(0,0,0,0.35); font: 12.5px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        color: #1f2328; overflow:hidden;
+      }
+      #rsf-confirm-box .rsf-c-head { padding: 14px 16px 6px; font-weight: 700; font-size: 14px; }
+      #rsf-confirm-box .rsf-c-body { padding: 4px 16px 14px; }
+      #rsf-confirm-box .rsf-c-body b { color:#0969da; }
+      #rsf-confirm-box .rsf-c-warn { background:#fff6e0; color:#9a6700; border-radius:6px; padding:8px; margin-top:8px; font-size:11.5px; }
+      #rsf-confirm-box .rsf-c-btns { display:flex; gap:8px; padding: 0 16px 16px; }
+      #rsf-confirm-box .rsf-c-btns button { flex:1; padding: 8px 10px; border-radius:6px; font-weight:600; font-size:12.5px; cursor:pointer; }
+      #rsf-confirm-cancel { background:#fff; border:1px solid #d0d7de; }
+      #rsf-confirm-cancel:hover { background:#f3f4f6; }
+      #rsf-confirm-go { background:#1f883d; color:#fff; border:1px solid transparent; }
+      #rsf-confirm-go:hover { background:#1a7f37; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function makeDraggable(panel, handle) {
+    let dragging = false, startX = 0, startY = 0, startRight = 0, startTop = 0;
+    handle.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+      dragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      const rect = panel.getBoundingClientRect();
+      startRight = window.innerWidth - rect.right;
+      startTop = rect.top;
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      panel.style.right = Math.max(4, startRight - dx) + 'px';
+      panel.style.top = Math.max(4, startTop + dy) + 'px';
+    });
+    window.addEventListener('mouseup', () => { dragging = false; });
+  }
+
+  function showConfirm({ targetId, skuFilters, count, total, cap }) {
+    return new Promise((resolve) => {
+      const overlay = document.createElement('div');
+      overlay.id = 'rsf-confirm-overlay';
+      overlay.innerHTML = `
+        <div id="rsf-confirm-box">
+          <div class="rsf-c-head">Confirm supplier change</div>
+          <div class="rsf-c-body">
+            This will reassign <b>${count}</b> of ${total} line item(s) on this requisition to
+            <b>${escapeHtml(targetId)}</b>${skuFilters.length ? ` (SKU filter: ${escapeHtml(skuFilters.join(', '))})` : ''}.
+            ${count > cap ? `<div class="rsf-c-warn">${count - cap} line(s) exceed your ${cap}-line cap and will be skipped this run.</div>` : ''}
+            <div class="rsf-c-warn">Each change is saved live in Birchstreet as it runs — this is not reversible by this tool. Double-check the target supplier before continuing.</div>
+          </div>
+          <div class="rsf-c-btns">
+            <button id="rsf-confirm-cancel">Cancel</button>
+            <button id="rsf-confirm-go">Confirm &amp; run</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+      const cleanup = (result) => { overlay.remove(); resolve(result); };
+      overlay.querySelector('#rsf-confirm-cancel').addEventListener('click', () => cleanup(false));
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(false); });
+      overlay.querySelector('#rsf-confirm-go').addEventListener('click', () => cleanup(true));
+    });
+  }
+
+  function buildUI() {
+    injectStyles();
+
+    const panel = document.createElement('div');
+    panel.id = 'rsf-panel';
+    panel.innerHTML = `
+      <div id="rsf-header">
+        <span class="rsf-title"><span class="rsf-dot" id="rsf-dot"></span>REQ Supplier Fixer</span>
+        <span>
+          <button id="rsf-collapse" title="Collapse">–</button>
+          <button id="rsf-close" title="Close">×</button>
+        </span>
+      </div>
+      <div id="rsf-body">
+        <div id="rsf-resume-banner" class="rsf-resume-banner" style="display:none;"></div>
+
+        <div class="rsf-field">
+          <label>Target supplier</label>
+          <input id="rsf-supplier" type="text" placeholder="ID (e.g. 2917) or name fragment (e.g. Chef 2 Chef)">
+        </div>
+        <div class="rsf-field">
+          <label>SKU filter (optional)</label>
+          <input id="rsf-sku" type="text" placeholder="Comma-separated SKUs, blank = all lines">
+        </div>
+        <div class="rsf-row2">
+          <div class="rsf-field">
+            <label>Max lines this run</label>
+            <input id="rsf-cap" type="text" value="25">
+          </div>
+          <div class="rsf-field" style="display:flex; align-items:flex-end;">
+            <div class="rsf-checkline" style="margin-bottom:8px;">
+              <input type="checkbox" id="rsf-dryrun">
+              <label for="rsf-dryrun">Dry run (preview only)</label>
+            </div>
+          </div>
+        </div>
+        <div class="rsf-hint">A safety cap and a confirmation step apply before any line is changed. Dry run scans and previews without touching anything.</div>
+
+        <div id="rsf-btnrow">
+          <button id="rsf-start">Start</button>
+          <button id="rsf-stop" disabled>Stop</button>
+        </div>
+
+        <div id="rsf-summary"></div>
+        <div id="rsf-rows"></div>
+        <button id="rsf-log-toggle">Show activity log</button>
+        <div id="rsf-log"></div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    const header = panel.querySelector('#rsf-header');
+    makeDraggable(panel, header);
+
+    panel.querySelector('#rsf-collapse').addEventListener('click', () => {
+      panel.classList.toggle('rsf-collapsed');
+      panel.querySelector('#rsf-collapse').textContent = panel.classList.contains('rsf-collapsed') ? '+' : '–';
+    });
+    panel.querySelector('#rsf-close').addEventListener('click', () => {
+      if (running) {
+        if (!confirm('A run is in progress. Close the panel anyway? The run will keep going but you will lose visibility into it.')) return;
+      }
+      panel.remove();
+    });
+
+    const rowsDiv = panel.querySelector('#rsf-rows');
+    const summaryDiv = panel.querySelector('#rsf-summary');
+    const logDiv = panel.querySelector('#rsf-log');
+    const logToggle = panel.querySelector('#rsf-log-toggle');
+    const dot = panel.querySelector('#rsf-dot');
+    const startBtn = panel.querySelector('#rsf-start');
+    const stopBtn = panel.querySelector('#rsf-stop');
+    const supplierInput = panel.querySelector('#rsf-supplier');
+    const skuInput = panel.querySelector('#rsf-sku');
+    const capInput = panel.querySelector('#rsf-cap');
+    const dryrunInput = panel.querySelector('#rsf-dryrun');
+    const resumeBanner = panel.querySelector('#rsf-resume-banner');
     const rowEls = {};
+
+    function renderLog() {
+      const log = loadLog();
+      if (!log.length) {
+        logDiv.textContent = '(no changes logged yet this session)';
+        return;
+      }
+      logDiv.textContent = log
+        .map((e) => `[${e.time.replace('T', ' ').slice(0, 19)}] line ${e.line}${e.sku ? ' (SKU ' + e.sku + ')' : ''}: ${e.from} → ${e.to} — ${e.status}${e.note ? ' (' + e.note + ')' : ''}`)
+        .join('\n');
+    }
+    renderLog();
+
+    logToggle.addEventListener('click', () => {
+      const open = logDiv.classList.toggle('rsf-log-open');
+      logToggle.textContent = open ? 'Hide activity log' : 'Show activity log';
+      if (open) renderLog();
+    });
 
     const ui = {
       renderRows(items) {
@@ -468,13 +780,13 @@
         for (const key in rowEls) delete rowEls[key];
         items.forEach((it) => {
           const row = document.createElement('div');
-          row.style.cssText =
-            'display:flex;align-items:center;gap:6px;padding:4px 4px;border-radius:4px;margin-bottom:3px;';
+          row.className = 'rsf-row';
+          row.style.background = STATUS_STYLES.pending.bg;
           row.innerHTML = `
-            <span class="rsf-icon">⏳</span>
-            <span style="flex:1;">
-              <div><b>Line ${it.line}</b> — ${it.supplierName || 'Unknown supplier'} (${it.supplierId})${it.sku ? ' — SKU ' + it.sku : ''}</div>
-              <div class="rsf-text" style="font-size:11px;color:#555;">Waiting…</div>
+            <span class="rsf-icon" style="background:${STATUS_STYLES.pending.color}">…</span>
+            <span class="rsf-main">
+              <div class="rsf-line">Line ${escapeHtml(it.line)} <span class="rsf-sub">— ${escapeHtml(it.supplierName || 'Unknown supplier')} (${escapeHtml(it.supplierId)})${it.sku ? ' · SKU ' + escapeHtml(it.sku) : ''}</span></div>
+              <div class="rsf-status-text">Waiting…</div>
             </span>
           `;
           rowsDiv.appendChild(row);
@@ -486,52 +798,101 @@
         if (!row) return;
         const style = STATUS_STYLES[status] || STATUS_STYLES.pending;
         row.style.background = style.bg;
+        row.querySelector('.rsf-icon').style.background = style.color;
         row.querySelector('.rsf-icon').textContent = style.icon;
-        const textEl = row.querySelector('.rsf-text');
+        const textEl = row.querySelector('.rsf-status-text');
         textEl.textContent = text;
         textEl.style.color = style.color;
+        renderLog();
       },
-      setSummary(text) {
+      setSummary(text, kind) {
+        const style = SUMMARY_STYLES[kind] || SUMMARY_STYLES.info;
+        summaryDiv.style.display = 'block';
+        summaryDiv.style.background = style.bg;
+        summaryDiv.style.color = style.color;
         summaryDiv.textContent = text;
+      },
+      setRunningState(isRunning) {
+        dot.classList.toggle('on', isRunning);
+        startBtn.disabled = isRunning;
+        stopBtn.disabled = !isRunning;
+        supplierInput.disabled = isRunning;
+        skuInput.disabled = isRunning;
+        capInput.disabled = isRunning;
+        dryrunInput.disabled = isRunning;
       },
     };
 
-    box.querySelector('#rsf-start').addEventListener('click', () => {
-      if (running) {
-        ui.setSummary('Already running.');
-        return;
-      }
-      const id = box.querySelector('#rsf-supplier').value.trim();
-      if (!id) {
-        ui.setSummary('Enter a supplier ID or name first.');
-        return;
-      }
-      const skuRaw = box.querySelector('#rsf-sku').value.trim();
-      const skuFilters = skuRaw
-        ? skuRaw.split(',').map((s) => normalizeSku(s)).filter(Boolean)
-        : [];
-      run(id, skuFilters, ui);
-    });
+    function parsedCap() {
+      const n = parseInt(capInput.value, 10);
+      return Number.isFinite(n) && n > 0 ? n : 25;
+    }
 
-    box.querySelector('#rsf-stop').addEventListener('click', () => {
+    async function startClicked() {
+      if (running) {
+        ui.setSummary('Already running.', 'warn');
+        return;
+      }
+      const id = supplierInput.value.trim();
+      if (!id) {
+        ui.setSummary('Enter a target supplier ID or name first.', 'err');
+        return;
+      }
+      const skuRaw = skuInput.value.trim();
+      const skuFilters = skuRaw ? skuRaw.split(',').map((s) => normalizeSku(s)).filter(Boolean) : [];
+      const cap = parsedCap();
+      const dryRun = dryrunInput.checked;
+
+      // Preview the scope so the confirmation dialog can show real numbers,
+      // without touching anything yet.
+      const allItems = scanReqLines();
+      const items = skuFilters.length ? allItems.filter((it) => skuFilters.includes(normalizeSku(it.sku))) : allItems;
+      const toFixCount = items.filter((it) => !itemMatchesTarget(it, id)).length;
+
+      if (toFixCount === 0) {
+        ui.renderRows(items);
+        items.forEach((it) => ui.setStatus(it.line, 'match', 'Already correct'));
+        ui.setSummary(`All matching line(s) already on ${id}. Nothing to do.`, 'ok');
+        return;
+      }
+
+      if (dryRun) {
+        run(id, skuFilters, cap, true, ui);
+        return;
+      }
+
+      const confirmed = await showConfirm({ targetId: id, skuFilters, count: toFixCount, total: items.length, cap });
+      if (!confirmed) {
+        ui.setSummary('Cancelled — no changes made.', 'warn');
+        return;
+      }
+      run(id, skuFilters, cap, false, ui);
+    }
+
+    startBtn.addEventListener('click', () => { startClicked(); });
+
+    stopBtn.addEventListener('click', () => {
       stopRequested = true;
       clearResumeState();
-      ui.setSummary('Stopping after current line…');
+      ui.setSummary('Stopping after the current line…', 'warn');
     });
 
     // Auto-resume: if a reload just happened mid-run (Save was clicked),
-    // pick the target supplier (and SKU filter, if any) back up and keep
-    // going without waiting for the user to click Start again.
+    // pick the target supplier (and SKU filter / cap, if any) back up and
+    // keep going without waiting for the user to click Start again. The
+    // remaining budget from before the reload is honored so a resumed run
+    // still can't exceed the cap the user originally confirmed.
     const resume = loadResumeState();
     if (resume) {
-      box.querySelector('#rsf-supplier').value = resume.targetId;
-      box.querySelector('#rsf-sku').value = resume.skuFilters.join(', ');
-      ui.setSummary(
-        `Resuming run for "${resume.targetId}"` +
+      supplierInput.value = resume.targetId;
+      skuInput.value = resume.skuFilters.join(', ');
+      if (resume.maxLines) capInput.value = String(resume.maxLines);
+      resumeBanner.style.display = 'block';
+      resumeBanner.textContent =
+        `Resuming an in-progress run for "${resume.targetId}"` +
         (resume.skuFilters.length ? ` (SKU filter: ${resume.skuFilters.join(', ')})` : '') +
-        ` after page reload…`
-      );
-      run(resume.targetId, resume.skuFilters, ui);
+        ` after a page reload. ${resume.remainingBudget} line(s) left in this run's budget.`;
+      run(resume.targetId, resume.skuFilters, resume.maxLines || 25, false, ui, resume.remainingBudget);
     }
   }
 
