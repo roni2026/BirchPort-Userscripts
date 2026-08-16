@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Birchstreet - Local Item Price Lookup (Floating UI)
 // @namespace    kingvamp-tools
-// @version      2.1
+// @version      2.2
 // @description  Floating panel: enter a part number, click Fetch Price, get supplier names + prices from Supplier Items tab. Ctrl+Alt+I fills from clipboard and runs automatically.
 // @author       Rick
 // @match        https://*.birchstreetsystems.com/*
@@ -103,9 +103,22 @@
     // Each finder now also requires the element to be visible, not just
     // present, before waitFor() will resolve on it.
 
-    const findLocalItemMaintenanceLeaf = () => {
-        const el = document.querySelector('[title="Local Item Maintenance"]') || document.getElementById('HN7');
+    // The nav tree is often collapsed behind a "Hide Menu" toggle icon
+    // before "Local Item Maintenance" is clickable.
+    const findHideMenuButton = () => {
+        const el = document.querySelector('img[title="Hide Menu"]');
         return el && isVisible(el) ? el : null;
+    };
+
+    const findLocalItemMaintenanceLeaf = () => {
+        // Try the old known selectors first (some Birchstreet builds render this).
+        let el = document.querySelector('[title="Local Item Maintenance"]') || document.getElementById('HN7');
+        if (el && isVisible(el)) return el;
+        // Fallback: the real element is a bare <span>Local Item Maintenance</span>
+        // with no id/title, so match on its text content instead.
+        const spans = Array.from(document.querySelectorAll('span'));
+        const match = spans.find((s) => s.children.length === 0 && s.textContent.trim() === 'Local Item Maintenance');
+        return match && isVisible(match) ? match : null;
     };
     const findSearchFieldSelect = () => {
         const el = document.getElementById('SearchField');
@@ -119,8 +132,10 @@
         const el = document.getElementById('searchButton');
         return el && isVisible(el) ? el : null;
     };
+    // Search results render the item name in a <td class="NavCWrp">; the old
+    // tr[id^="tb"] selector never matched Birchstreet's actual results markup.
     const findFirstResultRow = () => {
-        const el = document.querySelector('tr[id^="tb"]');
+        const el = document.querySelector('td.NavCWrp');
         return el && isVisible(el) ? el : null;
     };
 
@@ -138,6 +153,17 @@
     };
 
     // ---------------- Supplier grid parsing ----------------
+
+    // The UNIT_TRX_PRICE cell comes back as e.g. "MVR1.29702" - the currency
+    // code is jammed directly onto the number with no separator. Currency is
+    // already captured separately from TRX_CURRENCY, so strip any leading
+    // letters here to get a clean numeric price instead of a duplicated
+    // "MVR1.29702 MVR".
+    function parsePriceValue(raw) {
+        if (!raw) return raw;
+        const match = raw.match(/-?\d[\d,]*\.?\d*/);
+        return match ? match[0] : raw;
+    }
 
     function parseSupplierGrid() {
         const table = findSupplierGridTable();
@@ -180,7 +206,7 @@
                 const tds = Array.from(tr.children);
                 return {
                     supplier: cellAt(tds, nameIdx),
-                    price: cellAt(tds, priceIdx),
+                    price: parsePriceValue(cellAt(tds, priceIdx)),
                     currency: cellAt(tds, currencyIdx),
                     preferred: cellAt(tds, prefIdx),
                     inactive: cellAt(tds, inactiveIdx),
@@ -196,7 +222,14 @@
 
     async function step1_clickLocalItemMaintenance(partNumber) {
         setState('await_search_page', partNumber, 'Opening Local Item Maintenance...');
-        const leaf = await waitFor(findLocalItemMaintenanceLeaf, { timeout: 8000 });
+        // If the menu tree is already expanded, don't touch the Hide Menu
+        // toggle - clicking it again would just collapse it back.
+        let leaf = findLocalItemMaintenanceLeaf();
+        if (!leaf) {
+            const hideMenuBtn = await waitFor(findHideMenuButton, { timeout: 5000 }).catch(() => null);
+            if (hideMenuBtn) hideMenuBtn.click();
+            leaf = await waitFor(findLocalItemMaintenanceLeaf, { timeout: 8000 });
+        }
         leaf.click();
     }
 
