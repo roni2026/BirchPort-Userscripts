@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         REQ Supplier Auto-Fixer
 // @namespace    userscript-req-supplier-fix
-// @version      3.0
-// @description  Scans a requisition page and reassigns line item(s) to a target supplier, optionally filtered to specific item SKU(s). Adds confirmation, dry-run, change cap, and audit log.
+// @version      3.2
+// @description  Scans a requisition page and reassigns line item(s) to a target supplier, optionally filtered to specific item SKU(s). Adds confirmation, dry-run, change cap, audit log, and a guided (then remembered) fix for the "Tax code is invalid or blank" (1555) save-blocking alert.
 // @match        https://*.birchstreetsystems.com/*
 // @grant        unsafeWindow
 // @run-at       document-idle
@@ -93,19 +93,19 @@
   // popup's point of view) navigate to REQReport.jsp to show the updated
   // data. That kills this whole script instance mid-run. Since the reload
   // always gives us a fresh, authoritative view of which lines still need
-  // fixing, we don't need to preserve exact progress - just remember what
-  // we were targeting (single supplier, or the bulk SKU->supplier map),
-  // and auto-resume on the next load until there's nothing left to fix.
+  // fixing, we don't need to preserve exact progress - just remember which
+  // supplier ID we were targeting, and auto-resume on the next load until
+  // there's nothing left to fix.
   // ------------------------------------------------------------------
-  const RESUME_KEY = 'rsf_resume_state_v2';
+  const RESUME_KEY = 'rsf_resume_state_v1';
   const LOG_KEY = 'rsf_audit_log_v1';
   const RESUME_MAX_AGE_MS = 3 * 60 * 1000; // ignore stale flags from abandoned runs
 
-  function saveResumeState(spec, maxLines, remainingBudget) {
+  function saveResumeState(targetId, skuFilters, maxLines, remainingBudget) {
     try {
       sessionStorage.setItem(
         RESUME_KEY,
-        JSON.stringify({ spec, maxLines, remainingBudget, ts: Date.now() })
+        JSON.stringify({ targetId, skuFilters: skuFilters || [], maxLines, remainingBudget, ts: Date.now() })
       );
     } catch (e) {
       /* ignore storage errors */
@@ -125,18 +125,11 @@
       const raw = sessionStorage.getItem(RESUME_KEY);
       if (!raw) return null;
       const parsed = JSON.parse(raw);
-      if (!parsed || !parsed.spec || Date.now() - parsed.ts > RESUME_MAX_AGE_MS) {
+      if (!parsed || !parsed.targetId || Date.now() - parsed.ts > RESUME_MAX_AGE_MS) {
         clearResumeState();
         return null;
       }
-      if (parsed.spec.mode === 'single') {
-        parsed.spec.skuFilters = parsed.spec.skuFilters || [];
-      } else if (parsed.spec.mode === 'bulk') {
-        parsed.spec.map = parsed.spec.map || {};
-      } else {
-        clearResumeState();
-        return null;
-      }
+      parsed.skuFilters = parsed.skuFilters || [];
       return parsed;
     } catch (e) {
       return null;
@@ -173,6 +166,36 @@
       sessionStorage.removeItem(LOG_KEY);
     } catch (e) {
       /* ignore */
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // "Remember NA" for the tax-code alert.
+  //
+  // A native alert() can't be dismissed with a click - we can only
+  // intercept it (see installAlertInterceptor below) so it never appears.
+  // The first time that happens we ask the user once via the NA button.
+  // Once they answer, we remember that choice in sessionStorage (same
+  // storage the resume-state uses, so it survives the page reloads that
+  // happen after every Save) and auto-apply NA on every later tax-code
+  // alert in this run/session without asking again.
+  // ------------------------------------------------------------------
+  const AUTO_TAX_NA_KEY = 'rsf_auto_tax_na_v1';
+
+  function getAutoTaxNa() {
+    try {
+      return sessionStorage.getItem(AUTO_TAX_NA_KEY) === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setAutoTaxNa(on) {
+    try {
+      if (on) sessionStorage.setItem(AUTO_TAX_NA_KEY, '1');
+      else sessionStorage.removeItem(AUTO_TAX_NA_KEY);
+    } catch (e) {
+      /* ignore storage errors */
     }
   }
 
@@ -215,13 +238,10 @@
     return /^\d+$/.test(s);
   }
 
-  // Lets a "target" value be either a numeric supplier company ID (e.g.
+  // Lets the "target" field be either a numeric supplier company ID (e.g.
   // "2917") or a case-insensitive fragment of the supplier's name (e.g.
-  // "Chef 2 Chef", or a short name like "Feather" / "Salesco" as pasted
-  // from the bulk assignment list), since IDs aren't something users
-  // normally have handy.
+  // "chef 2 chef"), since IDs aren't something users normally have handy.
   function itemMatchesTarget(item, target) {
-    if (!target) return false;
     if (isNumericId(target)) {
       return item.supplierId === target;
     }
@@ -272,60 +292,90 @@
   }
 
   // ------------------------------------------------------------------
-  // Bulk assignment list parsing.
+  // Tax code validation popup handling.
   //
-  // Users can paste a table copied straight out of Excel/Sheets - typically
-  // with a header row like:
-  //   #  Supplier  Category  Item SKU  Product Desc.  Qty  UOM  Selected  Price
-  // followed by one data row per REQ line, where "Selected" holds the name
-  // of the supplier that line should be reassigned to (blank = leave alone).
-  //
-  // We look up the "Item SKU" and "Selected" columns by header name so a
-  // slightly different column order/count doesn't break things; if no
-  // header is recognized we fall back to the documented fixed layout above.
+  // When Save is clicked on the Edit Line popup, Birchstreet sometimes runs
+  // client-side validation (checkParameter()) that calls
+  // alert('1555- Tax code is invalid or blank.') and blocks the save. A
+  // native alert() has no clickable DOM element - it's rendered by the
+  // browser chrome, not the page - so it can't be dismissed with a
+  // click(). Instead we override window.alert on the Edit Line popup
+  // BEFORE clicking Save. That prevents the native dialog from ever
+  // appearing at all (functionally equivalent to it being instantly
+  // dismissed / "OK" pressed) and lets us capture the message so the panel
+  // can offer a one-click fix.
   // ------------------------------------------------------------------
-  function splitPastedLine(line) {
-    return line.indexOf('\t') !== -1 ? line.split('\t') : line.split(/ {2,}/);
+  const TAX_CODE_ALERT_RE = /tax code/i;
+
+  function installAlertInterceptor(win, onAlert) {
+    try {
+      win.alert = function (msg) {
+        onAlert(String(msg));
+      };
+    } catch (e) {
+      /* ignore - if we can't override it, the native dialog will just show
+         and the user can dismiss it manually */
+    }
   }
 
-  function parseBulkAssignments(raw) {
-    const lines = String(raw || '')
-      .split(/\r\n|\r|\n/)
-      .map((l) => l.replace(/\s+$/, ''))
-      .filter((l) => l.trim() !== '');
+  // Sets both tax code fields on the Edit Line popup to "NA", fires their
+  // onchange handlers (Birchstreet's CheckTaxCode(...) / checkParameter()
+  // logic depends on those actually firing, not just the value changing),
+  // and retries Save. Used both for the manual NA button and for the
+  // remembered auto-fill path below.
+  function applyTaxCodeNaFix(editWin) {
+    if (editWin.closed) return;
+    const doc = editWin.document;
+    const fill = (id) => {
+      const el = doc.getElementById(id);
+      if (!el) return;
+      el.value = 'NA';
+      el.dispatchEvent(new editWin.Event('change', { bubbles: true }));
+    };
+    fill('TaxCode1');
+    fill('TaxCode2');
+    const saveBtn = doc.getElementById('okclick');
+    if (saveBtn) saveBtn.click();
+  }
 
-    const result = { map: {}, skipped: [], rowCount: 0 };
-    if (!lines.length) return result;
+  // Shows a small "NA" fix prompt over the page for the FIRST tax-code
+  // alert in a run. Clicking it applies the NA fix and remembers the
+  // choice (via setAutoTaxNa) so every later tax-code alert in this run
+  // is fixed automatically without asking again. Resolves once the user
+  // has acted.
+  function showTaxCodeFix(editWin, item, alertMsg) {
+    return new Promise((resolve) => {
+      if (editWin.closed) { resolve(); return; }
+      const overlay = document.createElement('div');
+      overlay.id = 'rsf-tax-overlay';
+      overlay.innerHTML = `
+        <div id="rsf-tax-box">
+          <div class="rsf-c-head">⚠ Tax code required — line ${escapeHtml(item.line)}</div>
+          <div class="rsf-c-body">
+            Birchstreet blocked the save: <b>${escapeHtml(alertMsg)}</b><br><br>
+            Click <b>NA</b> to set both tax code fields to "NA" and retry Save.
+            <div class="rsf-c-warn">This is remembered for the rest of this run — any later tax-code alert will auto-fill NA without asking again.</div>
+          </div>
+          <div class="rsf-c-btns">
+            <button id="rsf-tax-na">NA</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
 
-    let startIdx = 0;
-    const headerCells = splitPastedLine(lines[0]).map((c) => c.trim().toLowerCase());
-    let skuIdx = headerCells.findIndex((c) => c.includes('sku'));
-    let selIdx = headerCells.findIndex((c) => c.includes('select'));
-    if (skuIdx !== -1 && selIdx !== -1) {
-      startIdx = 1; // recognized header row - consume it
-    } else {
-      // Fall back to the documented fixed layout:
-      // #, Supplier, Category, Item SKU, Product Desc., Qty, UOM, Selected, Price
-      skuIdx = 3;
-      selIdx = 7;
-    }
+      const cleanup = () => { overlay.remove(); resolve(); };
 
-    for (let i = startIdx; i < lines.length; i++) {
-      const cells = splitPastedLine(lines[i]);
-      const sku = normalizeSku(cells[skuIdx]);
-      const target = (cells[selIdx] || '').trim();
-      result.rowCount += 1;
-      if (!sku) {
-        result.skipped.push({ row: i + 1, reason: 'no SKU found on this line' });
-        continue;
-      }
-      if (!target) {
-        result.skipped.push({ row: i + 1, sku, reason: 'no supplier in the Selected column' });
-        continue;
-      }
-      result.map[sku] = target;
-    }
-    return result;
+      overlay.querySelector('#rsf-tax-na').addEventListener('click', () => {
+        try {
+          applyTaxCodeNaFix(editWin);
+        } catch (e) {
+          /* best effort - if this throws, the line will just surface as an
+             error status and the user can fix it manually in Birchstreet */
+        }
+        setAutoTaxNa(true);
+        cleanup();
+      });
+    });
   }
 
   // ---------- REQ page parsing ----------
@@ -379,6 +429,12 @@
       return btn && isVisible(btn);
     });
     await sleep(200);
+
+    // Install the tax-code alert interceptor as soon as the Edit Line
+    // popup is ready, so it's in place for whenever Save gets clicked
+    // later (see the checkParameter() note above Save, below).
+    let taxAlertMsg = null;
+    installAlertInterceptor(editWin, (msg) => { taxAlertMsg = msg; });
 
     ui.setStatus(item.line, 'processing', 'Opening supplier list…');
     const suppWinPromise = hookNextOpen(editWin);
@@ -461,6 +517,50 @@
     // doesn't trigger that reload.
     const originalSupplierId = item.supplierId;
     editWin.document.getElementById('okclick').click(); // "Save"
+
+    // Give Birchstreet's client-side validation a moment to run. If the tax
+    // code fields are blank/invalid, checkParameter() calls alert('1555-
+    // Tax code is invalid or blank.') instead of actually saving - our
+    // interceptor above swallows the native dialog and records the message
+    // here rather than letting it block the tab.
+    await sleep(400);
+    if (taxAlertMsg) {
+      const msg = taxAlertMsg;
+      if (!TAX_CODE_ALERT_RE.test(msg)) {
+        // Some other validation message we don't have specific handling
+        // for - don't guess at a fix, just report it and move on.
+        ui.setStatus(item.line, 'error', `Blocked by alert: ${msg}`);
+        appendLog({ line: item.line, sku: item.sku, from: originalSupplierId, to: targetId, status: 'error', note: `Unexpected alert: ${msg}` });
+        if (!editWin.closed) editWin.close();
+        return;
+      }
+
+      taxAlertMsg = null;
+
+      if (getAutoTaxNa()) {
+        // Already answered once earlier in this run - apply NA straight
+        // away without asking again.
+        ui.setStatus(item.line, 'tax_error', `Blocked: ${msg} — auto-filling NA (remembered)`);
+        try {
+          applyTaxCodeNaFix(editWin);
+        } catch (e) { /* falls through to the still-blocked check below */ }
+        appendLog({ line: item.line, sku: item.sku, from: originalSupplierId, to: targetId, status: 'tax_auto_na', note: msg });
+      } else {
+        ui.setStatus(item.line, 'tax_error', `Blocked: ${msg}`);
+        await showTaxCodeFix(editWin, item, msg);
+      }
+      await sleep(400);
+
+      // If it's still blocked after filling NA and retrying, don't loop
+      // forever - report it and move on to the next line.
+      if (taxAlertMsg) {
+        ui.setStatus(item.line, 'error', `Still blocked after NA fix: ${taxAlertMsg}`);
+        appendLog({ line: item.line, sku: item.sku, from: originalSupplierId, to: targetId, status: 'error', note: `Still blocked: ${taxAlertMsg}` });
+        if (!editWin.closed) editWin.close();
+        return;
+      }
+    }
+
     await waitForClosed(() => editWin).catch(() => {
       if (!editWin.closed) editWin.close();
     });
@@ -477,51 +577,29 @@
 
   // ---------- orchestration ----------
 
-  // `spec` is either:
-  //   { mode: 'single', targetId, skuFilters: [sku, ...] }
-  //   { mode: 'bulk', map: { sku: targetSupplierNameOrId, ... } }
-  function resolveTarget(spec, item) {
-    return spec.mode === 'bulk' ? spec.map[normalizeSku(item.sku)] : spec.targetId;
-  }
-
-  async function run(spec, maxLines, dryRun, ui, budgetOverride) {
+  async function run(targetId, skuFilters, maxLines, dryRun, ui, budgetOverride) {
     running = true;
     stopRequested = false;
     ui.setRunningState(true);
 
     const allItems = scanReqLines();
-    let items;
+    const items = skuFilters && skuFilters.length
+      ? allItems.filter((it) => skuFilters.includes(normalizeSku(it.sku)))
+      : allItems;
 
-    if (spec.mode === 'bulk') {
-      items = allItems.filter((it) => Object.prototype.hasOwnProperty.call(spec.map, normalizeSku(it.sku)));
-      if (items.length === 0) {
-        ui.renderRows([]);
-        ui.setSummary('No REQ line(s) on this page matched any SKU from the pasted list.', 'warn');
-        clearResumeState();
-        running = false;
-        ui.setRunningState(false);
-        return;
-      }
-    } else {
-      items = spec.skuFilters && spec.skuFilters.length
-        ? allItems.filter((it) => spec.skuFilters.includes(normalizeSku(it.sku)))
-        : allItems;
-      if (spec.skuFilters && spec.skuFilters.length && items.length === 0) {
-        ui.renderRows([]);
-        ui.setSummary(`No line(s) found matching SKU(s): ${spec.skuFilters.join(', ')}`, 'warn');
-        clearResumeState();
-        running = false;
-        ui.setRunningState(false);
-        return;
-      }
+    if (skuFilters && skuFilters.length && items.length === 0) {
+      ui.renderRows([]);
+      ui.setSummary(`No line(s) found matching SKU(s): ${skuFilters.join(', ')}`, 'warn');
+      clearResumeState();
+      running = false;
+      ui.setRunningState(false);
+      return;
     }
 
     ui.renderRows(items);
 
     const toFix = [];
     items.forEach((it) => {
-      const targetId = resolveTarget(spec, it);
-      it._targetId = targetId;
       if (itemMatchesTarget(it, targetId)) {
         ui.setStatus(it.line, 'match', 'Already correct');
       } else {
@@ -532,7 +610,7 @@
 
     if (toFix.length === 0) {
       clearResumeState();
-      ui.setSummary('All matching line(s) are already assigned correctly. Nothing to do.', 'ok');
+      ui.setSummary(`All matching line(s) already on ${targetId}. Nothing to do.`, 'ok');
       running = false;
       ui.setRunningState(false);
       return;
@@ -549,10 +627,10 @@
     overCap.forEach((it) => ui.setStatus(it.line, 'capped', `Skipped — over the ${maxLines}-line cap for this run`));
 
     if (dryRun) {
-      queued.forEach((it) => ui.setStatus(it.line, 'would_change', `Would change ${it.supplierId} → ${it._targetId}`));
+      queued.forEach((it) => ui.setStatus(it.line, 'would_change', `Would change ${it.supplierId} → ${targetId}`));
       clearResumeState();
       ui.setSummary(
-        `Dry run: ${queued.length} of ${items.length} line(s) would change.` +
+        `Dry run: ${queued.length} of ${items.length} line(s) would change to ${targetId}.` +
         (overCap.length ? ` ${overCap.length} more exceed the ${maxLines}-line cap.` : '') +
         ' No changes were made.',
         'info'
@@ -567,9 +645,9 @@
     // so this flag is what lets the next page load pick back up. We store
     // the remaining budget so a resumed run can't exceed the cap the user
     // originally approved.
-    saveResumeState(spec, maxLines, budget);
+    saveResumeState(targetId, skuFilters, maxLines, budget);
     ui.setSummary(
-      `${queued.length} of ${items.length} line(s) changing` +
+      `${queued.length} of ${items.length} line(s) changing to ${targetId}` +
       (overCap.length ? ` (${overCap.length} over the ${maxLines}-line cap, skipped)` : '') +
       '. This page reloads after each save — leave the tab open, the panel resumes itself.',
       'info'
@@ -582,13 +660,13 @@
         continue;
       }
       try {
-        await fixLine(item, item._targetId, ui);
+        await fixLine(item, targetId, ui);
       } catch (e) {
         ui.setStatus(item.line, 'error', e.message);
-        appendLog({ line: item.line, sku: item.sku, from: item.supplierId, to: item._targetId, status: 'error', note: e.message });
+        appendLog({ line: item.line, sku: item.sku, from: item.supplierId, to: targetId, status: 'error', note: e.message });
       }
       remaining -= 1;
-      saveResumeState(spec, maxLines, remaining);
+      saveResumeState(targetId, skuFilters, maxLines, remaining);
       await sleep(400);
     }
 
@@ -604,15 +682,16 @@
   // ---------- floating control panel ----------
 
   const STATUS_STYLES = {
-    match:        { icon: '✓', label: 'OK',      color: '#1a7f37', bg: '#eafbea' },
-    pending:      { icon: '…', label: 'Queued',  color: '#57606a', bg: '#f3f4f6' },
+    match:        { icon: '✓', label: 'OK', color: '#1a7f37', bg: '#eafbea' },
+    pending:      { icon: '…', label: 'Queued', color: '#57606a', bg: '#f3f4f6' },
     processing:   { icon: '↻', label: 'Working', color: '#0969da', bg: '#eaf2fe' },
-    success:      { icon: '✓', label: 'Done',    color: '#1a7f37', bg: '#eafbea' },
-    saved:        { icon: '⤓', label: 'Saved',   color: '#0969da', bg: '#eaf2fe' },
+    success:      { icon: '✓', label: 'Done', color: '#1a7f37', bg: '#eafbea' },
+    saved:        { icon: '⤓', label: 'Saved', color: '#0969da', bg: '#eaf2fe' },
     not_found:    { icon: '!', label: 'Not offered', color: '#9a6700', bg: '#fff6e0' },
-    error:        { icon: '✕', label: 'Error',   color: '#cf222e', bg: '#ffecec' },
-    capped:       { icon: '⊘', label: 'Capped',  color: '#9a6700', bg: '#fff6e0' },
+    error:        { icon: '✕', label: 'Error', color: '#cf222e', bg: '#ffecec' },
+    capped:       { icon: '⊘', label: 'Capped', color: '#9a6700', bg: '#fff6e0' },
     would_change: { icon: '→', label: 'Preview', color: '#8250df', bg: '#f5eeff' },
+    tax_error:    { icon: '⚠', label: 'Tax code', color: '#9a6700', bg: '#fff6e0' },
   };
 
   const SUMMARY_STYLES = {
@@ -629,7 +708,7 @@
     style.textContent = `
       #rsf-panel {
         position: fixed; top: 16px; right: 16px; z-index: 999999;
-        width: 400px; max-width: calc(100vw - 32px);
+        width: 380px; max-width: calc(100vw - 32px);
         background: #ffffff; color: #1f2328;
         border: 1px solid #d0d7de; border-radius: 10px;
         box-shadow: 0 8px 24px rgba(140,149,159,0.3), 0 1px 3px rgba(0,0,0,0.1);
@@ -648,7 +727,7 @@
         font-size: 14px; padding: 2px 6px; border-radius: 4px; line-height:1;
       }
       #rsf-header button:hover { background: rgba(255,255,255,0.15); color:#fff; }
-      #rsf-body { padding: 12px; max-height: 80vh; overflow-y: auto; }
+      #rsf-body { padding: 12px; }
       #rsf-panel.rsf-collapsed #rsf-body { display: none; }
       .rsf-field { margin-bottom: 8px; }
       .rsf-field label { display:block; font-weight:600; margin-bottom:3px; color:#57606a; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
@@ -656,14 +735,7 @@
         width: 100%; box-sizing: border-box; padding: 6px 8px;
         border: 1px solid #d0d7de; border-radius: 6px; font-size: 12.5px;
       }
-      .rsf-field textarea {
-        width: 100%; box-sizing: border-box; padding: 6px 8px;
-        border: 1px solid #d0d7de; border-radius: 6px; font-size: 11.5px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        resize: vertical; min-height: 70px;
-      }
-      .rsf-field input:focus, .rsf-field textarea:focus { outline: none; border-color:#0969da; box-shadow:0 0 0 3px rgba(9,105,218,0.15); }
-      .rsf-field input:disabled, .rsf-field textarea:disabled { background:#f6f8fa; color:#8c959f; }
+      .rsf-field input:focus { outline: none; border-color:#0969da; box-shadow:0 0 0 3px rgba(9,105,218,0.15); }
       .rsf-row2 { display:flex; gap:8px; }
       .rsf-row2 > div { flex: 1; }
       .rsf-checkline { display:flex; align-items:center; gap:6px; margin: 8px 0; }
@@ -683,7 +755,6 @@
         padding: 7px 9px; border-radius: 6px; margin-bottom: 8px; font-size: 12px;
         display: none;
       }
-      #rsf-bulk-info { font-size: 11px; color:#57606a; margin-top:4px; display:none; }
       #rsf-rows { max-height: 280px; overflow: auto; border-top: 1px solid #eaeef2; padding-top: 6px; }
       .rsf-row { display:flex; align-items:flex-start; gap:8px; padding:5px 6px; border-radius:6px; margin-bottom:3px; }
       .rsf-row .rsf-icon {
@@ -707,21 +778,38 @@
         display: flex; align-items: center; justify-content: center;
       }
       #rsf-confirm-box {
-        background: #fff; border-radius: 10px; width: 400px; max-width: calc(100vw - 40px);
+        background: #fff; border-radius: 10px; width: 360px; max-width: calc(100vw - 40px);
         box-shadow: 0 12px 32px rgba(0,0,0,0.35); font: 12.5px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
         color: #1f2328; overflow:hidden;
       }
       #rsf-confirm-box .rsf-c-head { padding: 14px 16px 6px; font-weight: 700; font-size: 14px; }
-      #rsf-confirm-box .rsf-c-body { padding: 4px 16px 14px; max-height: 50vh; overflow-y: auto; }
+      #rsf-confirm-box .rsf-c-body { padding: 4px 16px 14px; }
       #rsf-confirm-box .rsf-c-body b { color:#0969da; }
       #rsf-confirm-box .rsf-c-warn { background:#fff6e0; color:#9a6700; border-radius:6px; padding:8px; margin-top:8px; font-size:11.5px; }
-      #rsf-confirm-box .rsf-c-list { margin-top:8px; max-height:140px; overflow-y:auto; background:#f6f8fa; border-radius:6px; padding:6px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; }
       #rsf-confirm-box .rsf-c-btns { display:flex; gap:8px; padding: 0 16px 16px; }
       #rsf-confirm-box .rsf-c-btns button { flex:1; padding: 8px 10px; border-radius:6px; font-weight:600; font-size:12.5px; cursor:pointer; }
       #rsf-confirm-cancel { background:#fff; border:1px solid #d0d7de; }
       #rsf-confirm-cancel:hover { background:#f3f4f6; }
       #rsf-confirm-go { background:#1f883d; color:#fff; border:1px solid transparent; }
       #rsf-confirm-go:hover { background:#1a7f37; }
+
+      /* Tax code fix overlay - same look as the confirm overlay, own ids so
+         both could theoretically coexist without clashing */
+      #rsf-tax-overlay {
+        position: fixed; inset: 0; background: rgba(31,35,40,0.5); z-index: 1000001;
+        display: flex; align-items: center; justify-content: center;
+      }
+      #rsf-tax-box {
+        background: #fff; border-radius: 10px; width: 340px; max-width: calc(100vw - 40px);
+        box-shadow: 0 12px 32px rgba(0,0,0,0.35); font: 12.5px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        color: #1f2328; overflow:hidden;
+      }
+      #rsf-tax-box .rsf-c-head { padding: 14px 16px 6px; font-weight: 700; font-size: 14px; color:#9a6700; }
+      #rsf-tax-box .rsf-c-body { padding: 4px 16px 14px; }
+      #rsf-tax-box .rsf-c-body b { color:#0969da; }
+      #rsf-tax-box .rsf-c-btns { display:flex; gap:8px; padding: 0 16px 16px; }
+      #rsf-tax-na { flex:1; padding: 9px 10px; border-radius:6px; font-weight:700; font-size:13px; cursor:pointer; background:#9a6700; color:#fff; border:1px solid transparent; }
+      #rsf-tax-na:hover { background:#7d5500; }
     `;
     document.head.appendChild(style);
   }
@@ -748,40 +836,19 @@
     window.addEventListener('mouseup', () => { dragging = false; });
   }
 
-  function showConfirm({ spec, count, total, cap, bulkInfo }) {
+  function showConfirm({ targetId, skuFilters, count, total, cap }) {
     return new Promise((resolve) => {
       const overlay = document.createElement('div');
       overlay.id = 'rsf-confirm-overlay';
-
-      let bodyHtml;
-      if (spec.mode === 'bulk') {
-        const supplierCount = new Set(Object.values(spec.map)).size;
-        const skuCount = Object.keys(spec.map).length;
-        const previewLines = Object.entries(spec.map)
-          .slice(0, 12)
-          .map(([sku, target]) => `SKU ${sku} → ${target}`)
-          .join('\n');
-        bodyHtml = `
-          This will reassign <b>${count}</b> of ${total} line item(s) on this requisition, using
-          <b>${skuCount}</b> SKU→supplier assignment(s) from your pasted list (<b>${supplierCount}</b> distinct supplier(s)).
-          ${bulkInfo.skipped.length ? `<div class="rsf-c-warn">${bulkInfo.skipped.length} pasted row(s) were skipped (no SKU or no Selected supplier) and left untouched.</div>` : ''}
-          <div class="rsf-c-list">${escapeHtml(previewLines)}${Object.keys(spec.map).length > 12 ? '\n…' : ''}</div>
-          ${count > cap ? `<div class="rsf-c-warn">${count - cap} line(s) exceed your ${cap}-line cap and will be skipped this run.</div>` : ''}
-          <div class="rsf-c-warn">Each change is saved live in Birchstreet as it runs — this is not reversible by this tool. Double-check the pasted list before continuing.</div>
-        `;
-      } else {
-        bodyHtml = `
-          This will reassign <b>${count}</b> of ${total} line item(s) on this requisition to
-          <b>${escapeHtml(spec.targetId)}</b>${spec.skuFilters.length ? ` (SKU filter: ${escapeHtml(spec.skuFilters.join(', '))})` : ''}.
-          ${count > cap ? `<div class="rsf-c-warn">${count - cap} line(s) exceed your ${cap}-line cap and will be skipped this run.</div>` : ''}
-          <div class="rsf-c-warn">Each change is saved live in Birchstreet as it runs — this is not reversible by this tool. Double-check the target supplier before continuing.</div>
-        `;
-      }
-
       overlay.innerHTML = `
         <div id="rsf-confirm-box">
           <div class="rsf-c-head">Confirm supplier change</div>
-          <div class="rsf-c-body">${bodyHtml}</div>
+          <div class="rsf-c-body">
+            This will reassign <b>${count}</b> of ${total} line item(s) on this requisition to
+            <b>${escapeHtml(targetId)}</b>${skuFilters.length ? ` (SKU filter: ${escapeHtml(skuFilters.join(', '))})` : ''}.
+            ${count > cap ? `<div class="rsf-c-warn">${count - cap} line(s) exceed your ${cap}-line cap and will be skipped this run.</div>` : ''}
+            <div class="rsf-c-warn">Each change is saved live in Birchstreet as it runs — this is not reversible by this tool. Double-check the target supplier before continuing.</div>
+          </div>
           <div class="rsf-c-btns">
             <button id="rsf-confirm-cancel">Cancel</button>
             <button id="rsf-confirm-go">Confirm &amp; run</button>
@@ -816,19 +883,10 @@
           <label>Target supplier</label>
           <input id="rsf-supplier" type="text" placeholder="ID (e.g. 2917) or name fragment (e.g. Chef 2 Chef)">
         </div>
-        <div class="rsf-row2">
-          <div class="rsf-field">
-            <label>SKU filter (optional)</label>
-            <input id="rsf-sku" type="text" placeholder="Comma-separated SKUs, blank = all lines">
-          </div>
-        </div>
-
         <div class="rsf-field">
-          <label>Or paste a supplier list (overrides the fields above)</label>
-          <textarea id="rsf-bulk" placeholder="Paste the table copied from Excel, including the header row. Needs an &quot;Item SKU&quot; column and a &quot;Selected&quot; column (the target supplier for that line). Rows with a blank Selected column are left untouched."></textarea>
-          <div id="rsf-bulk-info"></div>
+          <label>SKU filter (optional)</label>
+          <input id="rsf-sku" type="text" placeholder="Comma-separated SKUs, blank = all lines">
         </div>
-
         <div class="rsf-row2">
           <div class="rsf-field">
             <label>Max lines this run</label>
@@ -841,7 +899,7 @@
             </div>
           </div>
         </div>
-        <div class="rsf-hint">A safety cap and a confirmation step apply before any line is changed. Dry run scans and previews without touching anything.</div>
+        <div class="rsf-hint">A safety cap and a confirmation step apply before any line is changed. Dry run scans and previews without touching anything. If Birchstreet blocks a save with "Tax code is invalid or blank", a one-click NA fix prompt appears automatically.</div>
 
         <div id="rsf-btnrow">
           <button id="rsf-start">Start</button>
@@ -850,6 +908,7 @@
 
         <div id="rsf-summary"></div>
         <div id="rsf-rows"></div>
+        <div id="rsf-autona-status" style="display:none; font-size:11px; color:#9a6700; margin-top:6px;"></div>
         <button id="rsf-log-toggle">Show activity log</button>
         <div id="rsf-log"></div>
       </div>
@@ -879,12 +938,30 @@
     const stopBtn = panel.querySelector('#rsf-stop');
     const supplierInput = panel.querySelector('#rsf-supplier');
     const skuInput = panel.querySelector('#rsf-sku');
-    const bulkInput = panel.querySelector('#rsf-bulk');
-    const bulkInfoDiv = panel.querySelector('#rsf-bulk-info');
     const capInput = panel.querySelector('#rsf-cap');
     const dryrunInput = panel.querySelector('#rsf-dryrun');
     const resumeBanner = panel.querySelector('#rsf-resume-banner');
+    const autoNaStatus = panel.querySelector('#rsf-autona-status');
     const rowEls = {};
+
+    function renderAutoNaStatus() {
+      if (getAutoTaxNa()) {
+        autoNaStatus.style.display = 'block';
+        autoNaStatus.innerHTML = '⚠ Tax-code fix remembered: NA will auto-fill on any tax-code alert. <a href="#" id="rsf-autona-clear" style="color:#0969da;">Forget</a>';
+        const clearLink = autoNaStatus.querySelector('#rsf-autona-clear');
+        if (clearLink) {
+          clearLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            setAutoTaxNa(false);
+            renderAutoNaStatus();
+          });
+        }
+      } else {
+        autoNaStatus.style.display = 'none';
+        autoNaStatus.innerHTML = '';
+      }
+    }
+    renderAutoNaStatus();
 
     function renderLog() {
       const log = loadLog();
@@ -903,26 +980,6 @@
       logToggle.textContent = open ? 'Hide activity log' : 'Show activity log';
       if (open) renderLog();
     });
-
-    // When the bulk paste box has content, it fully replaces the manual
-    // "Target supplier" / "SKU filter" fields for this run - grey them out
-    // so it's clear which mode is active, and show a live parse summary.
-    function updateBulkMode() {
-      const hasBulk = bulkInput.value.trim().length > 0;
-      supplierInput.disabled = hasBulk;
-      skuInput.disabled = hasBulk;
-      if (hasBulk) {
-        const parsed = parseBulkAssignments(bulkInput.value);
-        const assignCount = Object.keys(parsed.map).length;
-        bulkInfoDiv.style.display = 'block';
-        bulkInfoDiv.textContent = `Parsed ${assignCount} SKU→supplier assignment(s) from ${parsed.rowCount} row(s)` +
-          (parsed.skipped.length ? `; ${parsed.skipped.length} row(s) skipped (no SKU or no Selected supplier).` : '.');
-      } else {
-        bulkInfoDiv.style.display = 'none';
-        bulkInfoDiv.textContent = '';
-      }
-    }
-    bulkInput.addEventListener('input', updateBulkMode);
 
     const ui = {
       renderRows(items) {
@@ -954,6 +1011,7 @@
         textEl.textContent = text;
         textEl.style.color = style.color;
         renderLog();
+        renderAutoNaStatus();
       },
       setSummary(text, kind) {
         const style = SUMMARY_STYLES[kind] || SUMMARY_STYLES.info;
@@ -966,10 +1024,8 @@
         dot.classList.toggle('on', isRunning);
         startBtn.disabled = isRunning;
         stopBtn.disabled = !isRunning;
-        const hasBulk = bulkInput.value.trim().length > 0;
-        supplierInput.disabled = isRunning || hasBulk;
-        skuInput.disabled = isRunning || hasBulk;
-        bulkInput.disabled = isRunning;
+        supplierInput.disabled = isRunning;
+        skuInput.disabled = isRunning;
         capInput.disabled = isRunning;
         dryrunInput.disabled = isRunning;
       },
@@ -980,80 +1036,45 @@
       return Number.isFinite(n) && n > 0 ? n : 25;
     }
 
-    // Builds the run spec from whichever input mode is active, or returns
-    // { error } if the inputs don't make sense yet.
-    function buildSpec() {
-      const bulkRaw = bulkInput.value.trim();
-      if (bulkRaw) {
-        const parsed = parseBulkAssignments(bulkRaw);
-        const assignCount = Object.keys(parsed.map).length;
-        if (assignCount === 0) {
-          return { error: 'No usable SKU→supplier assignments found in the pasted list. Make sure it has an "Item SKU" column and a "Selected" column with a supplier filled in for at least one row.' };
-        }
-        return { spec: { mode: 'bulk', map: parsed.map }, bulkInfo: parsed };
-      }
-      const id = supplierInput.value.trim();
-      if (!id) {
-        return { error: 'Enter a target supplier ID or name, or paste a supplier list below.' };
-      }
-      const skuRaw = skuInput.value.trim();
-      const skuFilters = skuRaw ? skuRaw.split(',').map((s) => normalizeSku(s)).filter(Boolean) : [];
-      return { spec: { mode: 'single', targetId: id, skuFilters }, bulkInfo: null };
-    }
-
     async function startClicked() {
       if (running) {
         ui.setSummary('Already running.', 'warn');
         return;
       }
-
-      const built = buildSpec();
-      if (built.error) {
-        ui.setSummary(built.error, 'err');
+      const id = supplierInput.value.trim();
+      if (!id) {
+        ui.setSummary('Enter a target supplier ID or name first.', 'err');
         return;
       }
-      const { spec, bulkInfo } = built;
+      const skuRaw = skuInput.value.trim();
+      const skuFilters = skuRaw ? skuRaw.split(',').map((s) => normalizeSku(s)).filter(Boolean) : [];
       const cap = parsedCap();
       const dryRun = dryrunInput.checked;
 
       // Preview the scope so the confirmation dialog can show real numbers,
       // without touching anything yet.
       const allItems = scanReqLines();
-      const items = spec.mode === 'bulk'
-        ? allItems.filter((it) => Object.prototype.hasOwnProperty.call(spec.map, normalizeSku(it.sku)))
-        : (spec.skuFilters.length ? allItems.filter((it) => spec.skuFilters.includes(normalizeSku(it.sku))) : allItems);
-
-      if (items.length === 0) {
-        ui.renderRows([]);
-        ui.setSummary(
-          spec.mode === 'bulk'
-            ? 'No REQ line(s) on this page matched any SKU from the pasted list.'
-            : `No line(s) found matching SKU(s): ${spec.skuFilters.join(', ')}`,
-          'warn'
-        );
-        return;
-      }
-
-      const toFixCount = items.filter((it) => !itemMatchesTarget(it, resolveTarget(spec, it))).length;
+      const items = skuFilters.length ? allItems.filter((it) => skuFilters.includes(normalizeSku(it.sku))) : allItems;
+      const toFixCount = items.filter((it) => !itemMatchesTarget(it, id)).length;
 
       if (toFixCount === 0) {
         ui.renderRows(items);
         items.forEach((it) => ui.setStatus(it.line, 'match', 'Already correct'));
-        ui.setSummary('All matching line(s) are already assigned correctly. Nothing to do.', 'ok');
+        ui.setSummary(`All matching line(s) already on ${id}. Nothing to do.`, 'ok');
         return;
       }
 
       if (dryRun) {
-        run(spec, cap, true, ui);
+        run(id, skuFilters, cap, true, ui);
         return;
       }
 
-      const confirmed = await showConfirm({ spec, count: toFixCount, total: items.length, cap, bulkInfo });
+      const confirmed = await showConfirm({ targetId: id, skuFilters, count: toFixCount, total: items.length, cap });
       if (!confirmed) {
         ui.setSummary('Cancelled — no changes made.', 'warn');
         return;
       }
-      run(spec, cap, false, ui);
+      run(id, skuFilters, cap, false, ui);
     }
 
     startBtn.addEventListener('click', () => { startClicked(); });
@@ -1065,30 +1086,21 @@
     });
 
     // Auto-resume: if a reload just happened mid-run (Save was clicked),
-    // pick the run's spec (single target + SKU filter, or bulk map) back
-    // up and keep going without waiting for the user to click Start again.
-    // The remaining budget from before the reload is honored so a resumed
-    // run still can't exceed the cap the user originally confirmed.
+    // pick the target supplier (and SKU filter / cap, if any) back up and
+    // keep going without waiting for the user to click Start again. The
+    // remaining budget from before the reload is honored so a resumed run
+    // still can't exceed the cap the user originally confirmed.
     const resume = loadResumeState();
     if (resume) {
-      if (resume.spec.mode === 'single') {
-        supplierInput.value = resume.spec.targetId;
-        skuInput.value = resume.spec.skuFilters.join(', ');
-      } else {
-        bulkInput.value = Object.entries(resume.spec.map)
-          .map(([sku, target]) => `${sku}\t\t\t${target}`)
-          .join('\n');
-        updateBulkMode();
-      }
+      supplierInput.value = resume.targetId;
+      skuInput.value = resume.skuFilters.join(', ');
       if (resume.maxLines) capInput.value = String(resume.maxLines);
       resumeBanner.style.display = 'block';
       resumeBanner.textContent =
-        (resume.spec.mode === 'bulk'
-          ? `Resuming an in-progress bulk run (${Object.keys(resume.spec.map).length} SKU assignment(s))`
-          : `Resuming an in-progress run for "${resume.spec.targetId}"` +
-            (resume.spec.skuFilters.length ? ` (SKU filter: ${resume.spec.skuFilters.join(', ')})` : '')) +
+        `Resuming an in-progress run for "${resume.targetId}"` +
+        (resume.skuFilters.length ? ` (SKU filter: ${resume.skuFilters.join(', ')})` : '') +
         ` after a page reload. ${resume.remainingBudget} line(s) left in this run's budget.`;
-      run(resume.spec, resume.maxLines || 25, false, ui, resume.remainingBudget);
+      run(resume.targetId, resume.skuFilters, resume.maxLines || 25, false, ui, resume.remainingBudget);
     }
   }
 
