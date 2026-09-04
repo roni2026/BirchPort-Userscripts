@@ -1,13 +1,10 @@
 // ==UserScript==
 // @name         REQ SKU/Qty Auto-Filler
 // @namespace    roni2026.birchstreet.tools
-// @version      1.3
-// @description  Paste SKU + Qty rows, auto-filter the Order Sheet grid by SKU (Part #), then auto-fill quantities into matching rows — single instance, reaches into the grid's iframe automatically
+// @version      1.4
+// @description  Paste SKU + Qty rows, auto-filter the Order Sheet grid by SKU (Part #), then auto-fill quantities into matching rows — correctly targets the Order Sheet grid even when other ag-grid widgets exist on the same page
 // @author       roni2026
 // @match        *://*.birchstreetsystems.com/*
-// @match        *://*/*REQReport*
-// @match        *://*.birchstreet.net/*
-// @noframes
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -251,9 +248,13 @@
     }
 
     // ============================================================
-    // Find the document that actually contains the ag-grid.
-    // The grid may live in the top page, or inside a (possibly nested)
-    // same-origin iframe. Cross-origin iframes can't be accessed and are skipped.
+    // Find the document that actually contains the RIGHT ag-grid.
+    // IMPORTANT: this page can have more than one ag-grid instance at once
+    // (e.g. a small item-search grid sharing the same generic id="myGrid"
+    // alongside the real Order Sheet grid). We can't just grab the first
+    // .ag-root we find — we specifically require a "Quantity" column header,
+    // since that's what distinguishes the real Order Sheet grid from any
+    // other grid-like widget on the page.
     // ============================================================
     let gridDoc = null;
 
@@ -265,17 +266,28 @@
         }
     }
 
-    function searchForGridDocument(doc, visited) {
-        if (!doc || visited.has(doc)) return null;
+    function docHasQuantityColumn(doc) {
+        try {
+            const headerTexts = Array.from(doc.querySelectorAll('.ag-header-cell-text'));
+            return headerTexts.some(span => CONFIG.QTY_HEADER_TEXT.test(span.textContent.trim()));
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Collects every document on the page (main + same-origin iframes, recursively)
+    // that contains an ag-grid, so we can pick the best one rather than the first one.
+    function collectGridDocuments(doc, visited, results) {
+        if (!doc || visited.has(doc)) return;
         visited.add(doc);
 
-        if (docHasGrid(doc)) return doc;
+        if (docHasGrid(doc)) results.push(doc);
 
         let frames = [];
         try {
             frames = Array.from(doc.querySelectorAll('iframe, frame'));
         } catch (e) {
-            return null;
+            return;
         }
 
         for (const frameEl of frames) {
@@ -285,26 +297,36 @@
             } catch (e) {
                 continue; // cross-origin — can't access, skip
             }
-            const found = searchForGridDocument(innerDoc, visited);
-            if (found) return found;
+            collectGridDocuments(innerDoc, visited, results);
         }
-        return null;
     }
 
     function ensureGridDoc() {
-        // Reuse the cached doc if it's still valid
-        if (gridDoc && docHasGrid(gridDoc)) return gridDoc;
+        // Reuse the cached doc if it's still valid AND still has the Quantity column
+        if (gridDoc && docHasGrid(gridDoc) && docHasQuantityColumn(gridDoc)) return gridDoc;
 
-        const found = searchForGridDocument(document, new Set());
-        if (found) {
-            if (found !== gridDoc) {
-                log(found === document ? 'Grid found in the main page.' : 'Grid found inside an iframe — operating there.', 'ok');
-            }
-            gridDoc = found;
-        } else {
+        const candidates = [];
+        collectGridDocuments(document, new Set(), candidates);
+
+        if (candidates.length === 0) {
             gridDoc = null;
-            log('Could not locate the ag-grid (checked main page and same-origin iframes).', 'err');
+            log('Could not locate any ag-grid (checked main page and same-origin iframes).', 'err');
+            return null;
         }
+
+        // Prefer a candidate that actually has the Quantity column — that's the real Order Sheet.
+        const best = candidates.find(docHasQuantityColumn) || candidates[0];
+
+        if (best !== gridDoc) {
+            if (!docHasQuantityColumn(best)) {
+                log(`Found ${candidates.length} grid(s) on the page, but none has a "Quantity" column — using the first one, results may be wrong.`, 'warn');
+            } else if (candidates.length > 1) {
+                log(`Found ${candidates.length} grid(s) on the page — using the one with a "Quantity" column (the Order Sheet).`, 'ok');
+            } else {
+                log(best === document ? 'Grid found in the main page.' : 'Grid found inside an iframe — operating there.', 'ok');
+            }
+        }
+        gridDoc = best;
         return gridDoc;
     }
 
@@ -641,5 +663,5 @@
         await fillQuantities(dataMap);
     });
 
-    console.log('[REQ SKU/Qty Filler v1.3] loaded.');
+    console.log('[REQ SKU/Qty Filler v1.4] loaded.');
 })();
