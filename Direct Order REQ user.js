@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         REQ SKU/Qty Auto-Filler
 // @namespace    roni2026.birchstreet.tools
-// @version      1.2
-// @description  Paste SKU + Qty rows, auto-filter the Order Sheet grid by SKU (Part #), then auto-fill quantities into matching rows — works even when the grid lives inside an iframe
+// @version      1.3
+// @description  Paste SKU + Qty rows, auto-filter the Order Sheet grid by SKU (Part #), then auto-fill quantities into matching rows — single instance, reaches into the grid's iframe automatically
 // @author       roni2026
+// @match        *://*.birchstreetsystems.com/*
 // @match        *://*/*REQReport*
 // @match        *://*.birchstreet.net/*
+// @noframes
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -230,9 +232,14 @@
     }
 
     function clickEl(el) {
-        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        // Using the browser's native click() instead of manually dispatching
+        // mousedown/mouseup/click as separate synthetic events. The manual
+        // 3-event sequence was observed to make the Part# filter popup open
+        // and instantly close again (likely a toggle bound to mousedown that
+        // then also reacts to the separate synthetic click). Native .click()
+        // fires a single real click the way a physical click does.
+        el.focus({ preventScroll: true });
+        el.click();
     }
 
     // Normalize a SKU string for comparison — strips leading zeros so
@@ -634,5 +641,5 @@
         await fillQuantities(dataMap);
     });
 
-    console.log('[REQ SKU/Qty Filler v1.2] loaded.');
+    console.log('[REQ SKU/Qty Filler v1.3] loaded.');
 })();
