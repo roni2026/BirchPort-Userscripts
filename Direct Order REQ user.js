@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         REQ SKU/Qty Auto-Filler
 // @namespace    roni2026.birchstreet.tools
-// @version      1.4
-// @description  Paste SKU + Qty rows, auto-filter the Order Sheet grid by SKU (Part #), then auto-fill quantities into matching rows — correctly targets the Order Sheet grid even when other ag-grid widgets exist on the same page
+// @version      1.6
+// @description  Paste SKU + Qty rows, auto-filter the Order Sheet grid by SKU (Part #), auto-fill quantities into matching rows, scroll and repeat until all items are filled, and alert on any pasted item that didn't get filled
 // @author       roni2026
-// @match        *://*.birchstreetsystems.com/*
+// @match        https://*.birchstreetsystems.com/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -38,6 +38,9 @@
         ROW_SELECTOR: '.ag-row',
         CELL_SELECTOR: '.ag-cell',
 
+        // ag-grid scrollable viewport (where virtual scrolling happens)
+        GRID_VIEWPORT_SELECTOR: '.ag-body-viewport, .ag-center-cols-viewport',
+
         // Confirmed from a real recorded session: clicking a quantity cell swaps it to
         // <input id="QUANTITY{row-index}">, e.g. #QUANTITY0, #QUANTITY1, ...
         QTY_INPUT_ID_PREFIX: 'QUANTITY',
@@ -50,6 +53,15 @@
 
         // Delay between processing each row (ms)
         ROW_PROCESS_DELAY_MS: 150,
+
+        // Delay after each scroll to let ag-grid render new virtual rows (ms)
+        SCROLL_RENDER_DELAY_MS: 600,
+
+        // How many pixels to scroll each time
+        SCROLL_AMOUNT_PX: 600,
+
+        // Safety cap on scroll iterations
+        MAX_SCROLL_ITERATIONS: 100,
 
         // How to format the qty before typing it in.
         // Default: strips the ".000" padding -> "6.000" becomes "6" (matches the plain
@@ -394,6 +406,7 @@
             if (cols.length < 4) continue;
 
             const skuRaw = cols[0].trim();
+            const descRaw = (cols[1] || '').trim();
             const qtyRaw = cols[3].trim();
 
             if (/^item\s*sku$/i.test(skuRaw)) continue; // skip header row
@@ -403,7 +416,7 @@
             const qtyNum = parseFloat(qtyRaw.replace(/,/g, ''));
             if (isNaN(qtyNum)) continue;
 
-            rows.push({ sku, qty: qtyNum });
+            rows.push({ sku, qty: qtyNum, description: descRaw });
         }
         return rows;
     }
@@ -545,6 +558,10 @@
 
         const rowIndex = row.getAttribute('row-index');
 
+        // Scroll the row into view so ag-grid doesn't virtualize it away while we edit
+        qtyCell.scrollIntoView({ block: 'center', behavior: 'instant' });
+        await sleep(80);
+
         // Snapshot inputs already present, to support a fallback diff if the ID pattern doesn't match
         const before = new Set(doc.querySelectorAll('input, textarea'));
 
@@ -591,40 +608,130 @@
         return { ok: true };
     }
 
-    async function fillQuantities(dataMap) {
+    // Process all currently visible rows, skipping SKUs already handled in previous scrolls.
+    // Returns the SKUs that were successfully filled and those that matched but failed.
+    async function fillQuantities(dataMap, alreadyFilledSkus = new Set()) {
         const rows = getGridRows();
 
         if (rows.length === 0) {
-            log('No grid rows found after filtering. Nothing to fill.', 'warn');
-            return;
+            return { filledSkus: new Set(), foundButFailedSkus: new Set(), newRowsFound: false };
         }
-
-        log(`Found ${rows.length} row(s) in the grid. Matching against ${Object.keys(dataMap).length} SKUs...`);
 
         let filled = 0;
         let unmatched = 0;
+        let skipped = 0;
+        const filledSkus = new Set();
+        const foundButFailedSkus = new Set();
+        let atLeastOneNewRow = false;
 
         for (const row of rows) {
             const sku = getSkuFromRow(row);
-            if (!sku || !(sku in dataMap)) {
+            if (!sku) {
                 unmatched++;
                 continue;
             }
 
-            const qtyStr = CONFIG.formatQty(dataMap[sku]);
+            if (alreadyFilledSkus.has(sku)) {
+                skipped++;
+                continue;
+            }
+
+            atLeastOneNewRow = true;
+
+            if (!(sku in dataMap)) {
+                unmatched++;
+                continue;
+            }
+
+            const qtyStr = CONFIG.formatQty(dataMap[sku].qty);
             const result = await editRowQuantity(row, qtyStr);
 
             if (result.ok) {
                 filled++;
+                filledSkus.add(sku);
                 log(`SKU ${sku} -> qty ${qtyStr}`, 'ok');
             } else {
+                foundButFailedSkus.add(sku);
                 log(`SKU ${sku} matched but couldn't fill qty (${result.reason}).`, 'warn');
             }
 
             await sleep(CONFIG.ROW_PROCESS_DELAY_MS);
         }
 
-        log(`Done. Filled ${filled} row(s). ${unmatched} visible row(s) didn't match a pasted SKU.`, filled > 0 ? 'ok' : 'warn');
+        if (filled > 0) {
+            log(`Batch: filled ${filled}, skipped ${skipped}, unmatched ${unmatched}.`, 'ok');
+        }
+
+        return { filledSkus, foundButFailedSkus, newRowsFound: atLeastOneNewRow };
+    }
+
+    // ============================================================
+    // SCROLLING: keep scrolling the ag-grid viewport until we reach
+    // the bottom or every SKU has been filled.
+    // ============================================================
+    function getGridViewport() {
+        const doc = ensureGridDoc();
+        if (!doc) return null;
+        // ag-grid classic DOM: the viewport is usually .ag-body-viewport
+        let vp = doc.querySelector(CONFIG.GRID_VIEWPORT_SELECTOR);
+        if (!vp) {
+            // Fallback: the scrollable parent of the row container
+            const container = doc.querySelector(CONFIG.ROW_CONTAINER_SELECTOR);
+            if (container) vp = container.closest('.ag-body-viewport, .ag-center-cols-viewport, .ag-body-horizontal-scroll-viewport') || container.parentElement;
+        }
+        return vp;
+    }
+
+    async function scrollGridDown() {
+        const vp = getGridViewport();
+        if (!vp) return { didScroll: false, scrollTop: 0, scrollHeight: 0, clientHeight: 0 };
+
+        const before = vp.scrollTop;
+        vp.scrollTop += CONFIG.SCROLL_AMOUNT_PX;
+        await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
+
+        const after = vp.scrollTop;
+        const atBottom = (vp.scrollTop + vp.clientHeight) >= (vp.scrollHeight - 5); // 5px tolerance
+
+        return {
+            didScroll: after !== before,
+            scrollTop: after,
+            scrollHeight: vp.scrollHeight,
+            clientHeight: vp.clientHeight,
+            atBottom
+        };
+    }
+
+    function describeSku(sku, dataMap) {
+        const desc = dataMap[sku] && dataMap[sku].description;
+        return desc ? `${sku} (${desc})` : sku;
+    }
+
+    function reportMissingSkus(dataMap, filledSkus, foundButFailedSkus) {
+        const allSkus = Object.keys(dataMap);
+        const neverFound = allSkus.filter(s => !filledSkus.has(s) && !foundButFailedSkus.has(s));
+        const failedEdit = allSkus.filter(s => foundButFailedSkus.has(s));
+        const missing = [...neverFound, ...failedEdit];
+
+        if (missing.length === 0) {
+            log(`All ${allSkus.length} pasted item(s) were filled successfully.`, 'ok');
+            return;
+        }
+
+        const lines = [];
+        if (neverFound.length > 0) {
+            lines.push(`Not found in the filtered grid (${neverFound.length}):`);
+            neverFound.forEach(s => lines.push('  • ' + describeSku(s, dataMap)));
+        }
+        if (failedEdit.length > 0) {
+            lines.push(`Found but quantity couldn't be entered (${failedEdit.length}):`);
+            failedEdit.forEach(s => lines.push('  • ' + describeSku(s, dataMap)));
+        }
+
+        log(`${missing.length} of ${allSkus.length} pasted item(s) were NOT filled — see below.`, 'err');
+        missing.forEach(s => log('Missing: ' + describeSku(s, dataMap), 'err'));
+
+        alert(`${missing.length} item(s) were NOT filled in:\n\n${lines.join('\n')}`);
     }
 
     // ============================================================
@@ -650,7 +757,7 @@
         const dataMap = {};
         const skuList = [];
         for (const r of parsed) {
-            dataMap[r.sku] = r.qty;
+            dataMap[r.sku] = { qty: r.qty, description: r.description };
             skuList.push(r.sku);
         }
 
@@ -660,8 +767,55 @@
         log(`Waiting ${CONFIG.FILTER_APPLY_DELAY_MS}ms for the grid to refresh...`);
         await sleep(CONFIG.FILTER_APPLY_DELAY_MS);
 
-        await fillQuantities(dataMap);
+        // ========================================================
+        // SCROLL & FILL LOOP
+        // ========================================================
+        const totalFilledSkus = new Set();
+        const totalFailedSkus = new Set();
+        let iterations = 0;
+        let stagnantIterations = 0;
+
+        while (iterations < CONFIG.MAX_SCROLL_ITERATIONS) {
+            iterations++;
+
+            const { filledSkus, foundButFailedSkus, newRowsFound } = await fillQuantities(dataMap, totalFilledSkus);
+
+            filledSkus.forEach(s => totalFilledSkus.add(s));
+            foundButFailedSkus.forEach(s => totalFailedSkus.add(s));
+
+            const remaining = skuList.filter(s => !totalFilledSkus.has(s) && !totalFailedSkus.has(s));
+            if (remaining.length === 0) {
+                log('All SKUs have been processed.', 'ok');
+                break;
+            }
+
+            // Try to scroll down and load more virtual rows
+            const scrollResult = await scrollGridDown();
+
+            if (!scrollResult.didScroll && scrollResult.atBottom) {
+                log('Reached the bottom of the grid.', 'ok');
+                break;
+            }
+
+            if (!newRowsFound && !scrollResult.didScroll) {
+                stagnantIterations++;
+                if (stagnantIterations >= 3) {
+                    log('No new rows appearing after multiple scroll attempts — stopping.', 'warn');
+                    break;
+                }
+            } else {
+                stagnantIterations = 0;
+            }
+
+            log(`Scrolled down (${iterations}). Remaining SKUs: ${remaining.length}.`);
+        }
+
+        if (iterations >= CONFIG.MAX_SCROLL_ITERATIONS) {
+            log('Stopped: reached maximum scroll iterations.', 'warn');
+        }
+
+        reportMissingSkus(dataMap, totalFilledSkus, totalFailedSkus);
     });
 
-    console.log('[REQ SKU/Qty Filler v1.4] loaded.');
+    console.log('[REQ SKU/Qty Filler v1.6] loaded.');
 })();
