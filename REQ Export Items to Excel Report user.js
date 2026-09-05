@@ -1,241 +1,109 @@
 // ==UserScript==
-// @name         REQ Report - Export Items to Excel
-// @namespace    roni2026.birchstreet
-// @version      1.7
-// @description  Round floating icon (top-right) to export REQ line items as a bordered, pre-sized table (#, Supplier, Item SKU, Product Desc., Qty, UOM, Price, REQ), ready to paste into Excel
-// @author       roni2026
-// @match        *://*/*REQReport.jsp*
-// @grant        GM_setClipboard
-// @grant        GM_addStyle
+// @name         Auto Highlight REQ / PO / Supplier / Subject
+// @namespace    github.com/roni2026
+// @version      1.0
+// @description  Highlights REQ number, PO number, supplier name and Subject text in light green
+// @match        *://*/*
 // @run-at       document-idle
+// @grant        none
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    // --- Styles for the floating round icon button + toast ---
-    GM_addStyle(`
-        #reqExportBtn {
-            position: fixed;
-            top: 12px;
-            right: 12px;
-            z-index: 999999;
-            width: 40px;
-            height: 40px;
-            background: #1a7f37;
-            color: #fff;
-            font-size: 18px;
-            line-height: 1;
-            border: none;
-            border-radius: 50%;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.35);
-            cursor: pointer;
-            user-select: none;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 0;
-        }
-        #reqExportBtn:hover { background: #166a2e; }
-        #reqExportBtn:active { transform: scale(0.94); }
+    const HL_CLASS = 'tm-auto-highlight';
+    const HL_STYLE = 'background-color: #b5ff36; padding: 0 2px; border-radius: 2px;';
 
-        #reqExportToast {
-            position: fixed;
-            top: 60px;
-            right: 12px;
-            z-index: 999999;
-            background: #222;
-            color: #fff;
-            font-family: Arial, sans-serif;
-            font-size: 13px;
-            padding: 10px 16px;
-            border-radius: 6px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.35);
-            opacity: 0;
-            transition: opacity 0.25s ease;
-            pointer-events: none;
-        }
-        #reqExportToast.show { opacity: 1; }
-    `);
-
-    // Only inject the button in the frame that actually has the item rows
-    // (Birchstreet loads REQReport.jsp inside a frameset).
-    function pageHasItems() {
-        return document.querySelectorAll('div[name="EditLine"]').length > 0;
+    function highlight(node, start, end) {
+        if (end <= start) return;
+        const range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, end);
+        const span = document.createElement('span');
+        span.className = HL_CLASS;
+        span.style.cssText = HL_STYLE;
+        range.surroundContents(span);
     }
 
-    function extractItems() {
-        const items = [];
-        const editDivs = document.querySelectorAll('div[name="EditLine"]');
+    let pendingSubject = false; // set when a bare "Subject:" label is seen
 
-        editDivs.forEach((editDiv) => {
-            const row = editDiv.closest('tr');
-            if (!row) return;
+    function processNode(node) {
+        const text = node.nodeValue;
+        const trimmed = text.trim();
 
-            const cells = row.querySelectorAll('td');
-            if (cells.length < 7) return;
+        // Previous node was a bare "Subject:" label -> highlight this (the value) node
+        if (pendingSubject) {
+            if (!trimmed) return;
+            const lead = text.length - text.trimStart().length;
+            highlight(node, lead, text.length);
+            pendingSubject = false;
+            return;
+        }
 
-            const rowNum = cleanText(cells[0].innerText);
-            const supplier = cleanText(cells[1].innerText);
-            const skuRaw = cleanText(cells[2].innerText);
-            const itemNum = skuRaw.replace(/^0+(?=\d)/, ''); // strip leading zeros
+        // This node is ONLY the "Subject:" label -> wait for the value node
+        if (/^Subject:\s*$/i.test(trimmed)) {
+            pendingSubject = true;
+            return;
+        }
 
-            let desc = cleanText(cells[3].innerText);
-            // Remove leading "code / code" prefix, e.g. "1405.000031 / 8650000  BEEF BOLOR..."
-            desc = desc.replace(/^\S+\s*\/\s*\S+\s+/, '').trim();
+        // REQ-MAM-000037427 -> highlight "37427"
+        let m = text.match(/REQ-[A-Z0-9]+-0*(\d+)/);
+        if (m) {
+            const start = m.index + m[0].lastIndexOf(m[1]);
+            highlight(node, start, start + m[1].length);
+            return;
+        }
 
-            const qty = cleanText(cells[4].innerText);
-            const uom = cleanText(cells[5].innerText);
+        // PO-MAM-000021194 -> highlight "21194"
+        m = text.match(/PO-[A-Z0-9]+-0*(\d+)/);
+        if (m) {
+            const start = m.index + m[0].lastIndexOf(m[1]);
+            highlight(node, start, start + m[1].length);
+            return;
+        }
 
-            const priceRaw = cleanText(cells[6].innerText);
-            const priceNum = parseFloat(priceRaw.replace(/[^\d.]/g, ''));
-            const price = isNaN(priceNum) ? priceRaw : priceNum.toFixed(2);
+        // Supplier:  NAME -> highlight name only
+        m = text.match(/Supplier:\s*\u00A0*\s*(.+)$/);
+        if (m) {
+            const start = m.index + m[0].length - m[1].length;
+            highlight(node, start, text.length);
+            return;
+        }
 
-            if (!itemNum && !desc) return; // skip empty/malformed rows
-
-            items.push({ rowNum, supplier, itemNum, desc, qty, uom, price });
-        });
-
-        return items;
+        // "Subject: value" in the same node -> highlight after the colon
+        m = text.match(/Subject:\s*(.+)$/);
+        if (m && m[1].trim()) {
+            const start = m.index + m[0].length - m[1].length;
+            highlight(node, start, text.length);
+            return;
+        }
     }
 
-    // Find "REQ NUMBER : REQ-MAM-000037427" anywhere on the page
-    function findReqNumber() {
-        const tds = document.querySelectorAll('td');
-        for (const td of tds) {
-            if (/REQ NUMBER/i.test(td.innerText)) {
-                const m = td.innerText.match(/REQ NUMBER\s*:\s*([A-Z0-9-]+)/i);
-                if (m) return m[1];
+    function scan() {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+            acceptNode(n) {
+                const p = n.parentElement;
+                if (!p) return NodeFilter.FILTER_REJECT;
+                if (/^(SCRIPT|STYLE|NOSCRIPT)$/.test(p.tagName)) return NodeFilter.FILTER_REJECT;
+                if (p.classList && p.classList.contains(HL_CLASS)) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
             }
-        }
-        const m = document.body.innerText.match(/REQ NUMBER\s*:\s*([A-Z0-9-]+)/i);
-        return m ? m[1] : null;
-    }
-
-    // "REQ-MAM-000037427" -> "REQ - 37427" (leading zeros removed, same format as your Excel file)
-    function reqShort(full) {
-        const digits = full.match(/(\d+)$/);
-        return digits ? `REQ - ${parseInt(digits[1], 10)}` : full;
-    }
-
-    function cleanText(str) {
-        return (str || '')
-            .replace(/\u00A0/g, ' ') // non-breaking spaces
-            .replace(/\s+/g, ' ')
-            .trim();
-    }
-
-    function escapeHtml(str) {
-        return String(str)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;');
-    }
-
-    // Column config: width (pixels) + DATA alignment — matches your Test.xlsx layout
-    // # | Supplier | Item SKU | Product Desc. | Qty | UOM | Price | REQ
-    // (All headers are centered regardless of the align set here.)
-    const COLUMNS = [
-        { width: 45,  align: 'center' }, // #
-        { width: 155, align: 'left'   }, // Supplier (data left, header center)
-        { width: 80,  align: 'center' }, // Item SKU
-        { width: 365, align: 'left'   }, // Product Desc. (data left, header center)
-        { width: 55,  align: 'center' }, // Qty
-        { width: 55,  align: 'center' }, // UOM
-        { width: 70,  align: 'center' }, // Price
-        { width: 100, align: 'center' }, // REQ
-    ];
-
-    // 0.5pt = Excel's thin "All Borders" line weight
-    const TD_BASE = 'border:0.5pt solid #000000; padding:2px 4px; font-family:Arial; font-size:10pt; white-space:nowrap;';
-
-    // Build a cell with BOTH width attribute and inline width style —
-    // Excel only reliably honors pasted column widths when both are present.
-    // Headers are ALWAYS centered; data cells use the column's align setting.
-    function makeCell(content, colIndex, isHeader) {
-        const col = COLUMNS[colIndex];
-        const widthAttr = `width="${col.width}"`;
-        const widthStyle = `width:${col.width}px;`;
-        const bold = isHeader ? ' font-weight:bold;' : '';
-        const align = isHeader ? 'center' : col.align;
-        return `<td ${widthAttr} style="${TD_BASE}${widthStyle} text-align:${align};${bold}">${content}</td>`;
-    }
-
-    function buildHtmlTable(items, reqNum) {
-        const reqHeader = reqNum ? escapeHtml(reqShort(reqNum)) : 'REQ #';
-
-        let html = `<table border="1" cellspacing="0" cellpadding="2" style="border-collapse:collapse;">`;
-
-        // Header row (all headers centered)
-        html += '<tr>';
-        ['#', 'Supplier', 'Item SKU', 'Product Desc.', 'Qty', 'UOM', 'Price'].forEach((h, i) => {
-            html += makeCell(escapeHtml(h), i, true);
         });
-        html += makeCell(reqHeader, 7, true);
-        html += '</tr>';
-
-        // Data rows (alignment per column config)
-        items.forEach(i => {
-            const row = [i.rowNum, i.supplier, i.itemNum, i.desc, i.qty, i.uom, i.price, '-'];
-            html += '<tr>' + row.map((v, c) => makeCell(escapeHtml(v), c, false)).join('') + '</tr>';
-        });
-
-        html += '</table>';
-        return html;
-    }
-
-    function showToast(message) {
-        let toast = document.getElementById('reqExportToast');
-        if (!toast) {
-            toast = document.createElement('div');
-            toast.id = 'reqExportToast';
-            document.body.appendChild(toast);
+        const nodes = [];
+        let n;
+        while ((n = walker.nextNode())) nodes.push(n);
+        for (const node of nodes) {
+            try { processNode(node); } catch (e) { /* ignore */ }
         }
-        toast.textContent = message;
-        toast.classList.add('show');
-        clearTimeout(toast._hideTimer);
-        toast._hideTimer = setTimeout(() => toast.classList.remove('show'), 3500);
     }
 
-    function exportItems() {
-        const items = extractItems();
+    scan(); // first pass
 
-        if (items.length === 0) {
-            showToast('⚠️ No items found on this page.');
-            return;
-        }
-
-        const reqNum = findReqNumber();
-        const html = buildHtmlTable(items, reqNum);
-
-        GM_setClipboard(html, 'html');
-        showToast(`✅ Exported ${items.length} item${items.length === 1 ? '' : 's'}${reqNum ? ' (' + reqShort(reqNum) + ')' : ''} to clipboard!`);
-    }
-
-    function addButton() {
-        if (document.getElementById('reqExportBtn')) return; // already added
-        const btn = document.createElement('button');
-        btn.id = 'reqExportBtn';
-        btn.textContent = '📋'; // icon only, no text
-        btn.title = 'Export Items to Excel';
-        btn.addEventListener('click', exportItems);
-        document.body.appendChild(btn);
-    }
-
-    function init() {
-        if (!pageHasItems()) return;
-        addButton();
-    }
-
-    // Try immediately, and retry briefly in case content loads a moment later
-    init();
-    let attempts = 0;
-    const retry = setInterval(() => {
-        attempts++;
-        if (document.getElementById('reqExportBtn') || attempts > 10) {
-            clearInterval(retry);
-            return;
-        }
-        init();
-    }, 500);
+    // re-scan on dynamic content changes
+    let timer = null;
+    new MutationObserver((muts) => {
+        if (!muts.some(mu => [...mu.addedNodes].some(nd => nd.nodeType <= 3))) return;
+        clearTimeout(timer);
+        timer = setTimeout(scan, 300);
+    }).observe(document.body, { childList: true, subtree: true });
 })();
