@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         REQ Quantity Auto-Filler
 // @namespace    roni2026.birchstreet.tools
-// @version      2.2
-// @description  Paste SKU + Qty rows, auto-filter the Order Sheet grid by SKU (Part #), auto-fill quantities into matching rows in top-to-bottom order, auto-correct any Req UOM mismatch via the UOM picker dialog (flagging in red when it can't), scroll and repeat until all items are filled, and alert on any pasted item that didn't get filled
+// @version      4.0
+// @description  Sequential one-by-one REQ filler: no skipped rows, wait-for-element pacing (fast but safe), scroll restore after UOM dialogs, cheap quantity verification.
 // @author       roni2026
 // @match        https://*.birchstreetsystems.com/*
 // @grant        none
@@ -13,185 +13,302 @@
     'use strict';
 
     // ============================================================
+    // v4.0 — full rewrite of the processing engine.
+    //
+    // What changed and why:
+    //
+    // 1) SEQUENTIAL, ONE-BY-ONE PROCESSING.
+    //    v3.x snapshotted "currently visible SKUs" and then edited
+    //    them one at a time. Any scroll jump in between (UOM zoom
+    //    button focus, AG Grid auto-scroll on commit, dialog
+    //    re-renders) recycled rows out from under that snapshot,
+    //    which is exactly the "skips 4-5 rows" symptom. v4.0 has
+    //    NO snapshot: it takes one row, finishes it completely
+    //    (UOM check/correction + quantity + verification), and
+    //    only then looks at anything else. A row can never be
+    //    skipped, because the script never holds a stale list.
+    //
+    // 2) WAIT-FOR-ELEMENT, NOT FIXED SLEEPS.
+    //    Every pause in v3.x was a fixed setTimeout (250ms here,
+    //    220ms there, 350ms after commit...). That is both slow
+    //    (you always pay the full sleep even when the app already
+    //    responded) and brittle (you fail when the app is slower
+    //    than the sleep). v4.0 polls for the actual element it
+    //    needs (editor appeared? dialog open? dialog closed?
+    //    quantity stuck?) and continues the instant it shows up,
+    //    with generous timeouts as the safety net.
+    //
+    // 3) CHEAP QUANTITY VERIFICATION.
+    //    v3.x verification re-ran full iframe discovery 5 times
+    //    per row. v4.0 polls the quantity cell text directly in
+    //    the already-known document — one comparison per ~70ms.
+    //
+    // 4) SCROLL-RESTORE + RELOCATE AFTER UOM DIALOGS.
+    //    Same idea as v3.4 but now it's the only code path, and
+    //    because processing is one-row-at-a-time there is no
+    //    snapshot to invalidate — the worst case is one extra
+    //    locate-by-SKU, which is cheap.
+    //
+    // 5) NOTHING IS WRITTEN OFF PREMATURELY.
+    //    A SKU only lands in "failed" after its quantity retries
+    //    are truly exhausted. Everything else stays in the
+    //    remaining pool and is picked up by the automatic
+    //    top-to-bottom recovery sweep when the grid hits bottom.
+    // ============================================================
+
+    const ORDER_SHEET_FRAME_NAME = 'OrderSheetTab';
+
+    // ------------------------------------------------------------
+    // Host-frame selection (unchanged logic from v3.x, condensed)
+    // ------------------------------------------------------------
+
+    const CONFIG_QTY_HEADER_TEXT = /^quantity$/i;
+    const CONFIG_SKU_HEADER_TEXT = /^part\s*#?$/i;
+
+    function looksLikeOrderSheetGrid(doc) {
+        if (!doc) return false;
+        try {
+            const headers = Array.from(doc.querySelectorAll('.ag-header-cell-text'))
+                .map(s => s.textContent.trim());
+            return headers.some(t => CONFIG_QTY_HEADER_TEXT.test(t)) &&
+                   headers.some(t => CONFIG_SKU_HEADER_TEXT.test(t));
+        } catch (_) { return false; }
+    }
+
+    function findNamedFrameReachable(win, targetName, visited) {
+        visited = visited || new Set();
+        if (visited.has(win)) return false;
+        visited.add(win);
+        let doc = null;
+        try { doc = win.document; } catch (_) { return false; }
+        let direct = null;
+        try {
+            direct = doc.querySelector(`iframe[name="${targetName}"], iframe#${targetName}, frame[name="${targetName}"], frame#${targetName}`);
+        } catch (_) { direct = null; }
+        if (direct) return true;
+        let childEls = [];
+        try { childEls = Array.from(doc.querySelectorAll('iframe, frame')); } catch (_) { childEls = []; }
+        for (const el of childEls) {
+            let childWin = null;
+            try {
+                childWin = el.contentWindow;
+                if (!childWin) continue;
+                void childWin.document;
+            } catch (_) { continue; }
+            if (findNamedFrameReachable(childWin, targetName, visited)) return true;
+        }
+        return false;
+    }
+
+    function isHostFrame() {
+        if (window.name === ORDER_SHEET_FRAME_NAME) return true;
+        if (looksLikeOrderSheetGrid(document)) return true;
+        if (findNamedFrameReachable(window, ORDER_SHEET_FRAME_NAME)) return false;
+        return false;
+    }
+
+    if (!isHostFrame()) return;
+
+    if (document.getElementById('reqFillerPanel')) {
+        console.log('[REQ SKU/Qty Filler v4] Already running — skipping duplicate init.');
+        return;
+    }
+
+    // ============================================================
     // CONFIG
     // ============================================================
+
     const CONFIG = {
-        // Header text used to auto-detect the SKU (Part #) and Quantity columns.
-        // col-ids in Birchstreet are session/instance-specific, so header text is the
-        // primary detection method; hardcoded col-ids below are only a last-resort fallback.
         SKU_HEADER_TEXT: /^part\s*#?$/i,
         SKU_COL_ID_FALLBACK: '31239',
-
         QTY_HEADER_TEXT: /^quantity$/i,
         QTY_COL_ID_FALLBACK: '31242',
-
-        // "Req UOM" column — used to flag/correct a mismatch against the UOM the user pasted in.
         UOM_HEADER_TEXT: /^req\s*uom$/i,
         UOM_COL_ID_FALLBACK: '31241',
 
-        // Color used for the floating "your UOM differs" flag text, and for the
-        // "this was auto-corrected" marker, next to/on Req UOM.
         UOM_MISMATCH_COLOR: '#ff5555',
+        UOM_PICKER_HEADER_TEXT: /^uom$/i,
+        UOM_PICKER_SELECT_BUTTON_TEXT: /^select$/i,
 
-        // ag-grid text filter input (appears in the column filter popup, placeholder "Filter...")
         FILTER_INPUT_SELECTOR: 'input.ag-input-field-input.ag-text-field-input[type="text"]',
         FILTER_INPUT_PLACEHOLDER: 'Filter...',
-
-        // Apply Filter button in that same popup (NOTE: "Clear Filter" shares the same classes,
-        // so matching is done by text, not just this selector)
         APPLY_BUTTON_SELECTOR: 'button.ag-standard-button.ag-filter-apply-panel-button',
 
-        // Real row/cell selectors, scoped to the center (non-pinned) column container
         ROW_CONTAINER_SELECTOR: '.ag-center-cols-container',
         ROW_SELECTOR: '.ag-row',
         CELL_SELECTOR: '.ag-cell',
-
-        // ag-grid scrollable viewport (where virtual scrolling happens)
         GRID_VIEWPORT_SELECTOR: '.ag-body-viewport, .ag-center-cols-viewport',
 
-        // Confirmed from a real recorded session: clicking a quantity cell swaps it to
-        // <input id="QUANTITY{row-index}">, e.g. #QUANTITY0, #QUANTITY1, ...
         QTY_INPUT_ID_PREFIX: 'QUANTITY',
-
-        // Confirmed from the Req UOM cell markup: clicking it swaps to
-        // <input id="REQUESTED_UOM{row-index}" disabled> + <button id="REQUESTED_UOM{row-index}ZM">
-        // (the "ZM" = zoom button that opens the UOM picker dialog).
         UOM_INPUT_ID_PREFIX: 'REQUESTED_UOM',
         UOM_ZOOM_BTN_ID_SUFFIX: 'ZM',
 
-        // In the UOM picker dialog's own ag-grid, the plain "UOM" column (not "Inventory UOM",
-        // "Default Inv UOM", etc.) is what we match the pasted UOM against. Confirmed from a real
-        // recorded session: you click the cell under this column for the desired row (which then
-        // shows ag-row-selected on that row), then click Select.
-        UOM_PICKER_HEADER_TEXT: /^uom$/i,
-        UOM_PICKER_SELECT_BUTTON_TEXT: /^select$/i,
-        UOM_PICKER_CLOSE_BUTTON_TEXT: /^close$/i,
+        // ---- timing (poll-based, not fixed sleeps) ----
+        POLL_FAST_MS: 60,
+        POLL_MS: 100,
 
-        // How many times / how often to poll for the picker dialog to appear, and for it
-        // to disappear again after clicking Select.
-        UOM_DIALOG_WAIT_ATTEMPTS: 20,
-        UOM_DIALOG_POLL_MS: 150,
+        EDITOR_WAIT_TIMEOUT_MS: 2500, // qty editor to appear after cell click
+        DIALOG_OPEN_TIMEOUT_MS: 8000, // UOM picker to open
+        DIALOG_CLOSE_TIMEOUT_MS: 8000, // UOM picker to close after Select
+        VERIFY_TIMEOUT_MS: 2000, // qty to stick after commit
+        FILTER_APPLY_SETTLE_MS: 1000, // grid refresh after Apply Filter
+        POST_EDIT_SETTLE_MS: 120, // tiny breath between ops on same row
+        ROW_TO_ROW_DELAY_MS: 60, // gap between rows (keeps UI responsive)
 
-        // Retry count/delay for clicking a picker row and confirming ag-grid actually
-        // registered the selection (ag-row-selected) before we trust it and hit Select.
-        UOM_ROW_SELECT_RETRY_ATTEMPTS: 3,
-        UOM_ROW_SELECT_CHECK_DELAY_MS: 200,
+        QTY_EDIT_RETRY_ATTEMPTS: 3,
+        UOM_OPEN_RETRY_ATTEMPTS: 3,
 
-        // How many times to retry opening the UOM picker dialog if it flashes open and
-        // instantly closes again (a toggle-close issue, separate from it not opening at all).
-        UOM_DIALOG_OPEN_RETRY_ATTEMPTS: 3,
+        SCROLL_RENDER_DELAY_MS: 350, // after a viewport scroll
+        RECOVERY_PASSES: 2, // top-to-bottom re-scans at bottom
+        MAX_SCROLL_ITERATIONS: 400,
 
-        // Extra settle time after a UOM correction, since changing Req UOM can trigger the
-        // underlying app to refresh/re-render the Order Sheet grid.
-        UOM_POST_SELECT_DELAY_MS: 1200,
+        UOM_MARKER_REAPPLY_INTERVAL_MS: 500,
 
-        // Set to false to go back to just flagging UOM mismatches in red without attempting
-        // to open the picker and correct them.
-        UOM_CORRECTION_ENABLED: true,
-
-        // Delay after clicking Apply Filter before we start filling quantities (ms)
-        FILTER_APPLY_DELAY_MS: 800,
-
-        // Delay after clicking a qty cell before we look for its input (ms)
-        CELL_EDIT_DELAY_MS: 200,
-
-        // Delay between processing each row (ms)
-        ROW_PROCESS_DELAY_MS: 150,
-
-        // Delay after each scroll to let ag-grid render new virtual rows (ms)
-        SCROLL_RENDER_DELAY_MS: 600,
-
-        // How many pixels to scroll each time
-        SCROLL_AMOUNT_PX: 600,
-
-        // Safety cap on scroll iterations
-        MAX_SCROLL_ITERATIONS: 100,
-
-        // How many times to retry opening the Part # filter menu if it closes on us before
-        // the filter input is usable, and how long to wait between attempts / before
-        // deciding it actually opened. Also reused for retrying "click the Req UOM cell
-        // until its zoom button actually appears".
-        FILTER_OPEN_RETRY_ATTEMPTS: 3,
-        FILTER_OPEN_CHECK_DELAY_MS: 300,
-        FILTER_OPEN_RETRY_DELAY_MS: 400,
-
-        // How to format the qty before typing it in.
-        // Default: strips the ".000" padding -> "6.000" becomes "6" (matches the plain
-        // "5", "10", "15" values seen in the recorded session).
-        formatQty(qtyNumber) {
-            return String(qtyNumber);
-        }
+        formatQty(q) { return String(q); }
     };
 
     // ============================================================
-    // UI (always attached to the top-level page, regardless of where the grid lives)
+    // GENERIC HELPERS
     // ============================================================
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    // Poll `fn` until it returns a truthy value or timeout.
+    async function waitFor(fn, timeoutMs, pollMs) {
+        pollMs = pollMs || CONFIG.POLL_MS;
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            try {
+                const v = fn();
+                if (v) return v;
+            } catch (_) {}
+            await sleep(pollMs);
+        }
+        return null;
+    }
+
+    function isVisible(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    }
+
+    function setNativeValue(el, value) {
+        if (!el) return false;
+        const s = String(value);
+        let proto = el, setter = null;
+        while (proto && !setter) {
+            const d = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (d && d.set) { setter = d.set; break; }
+            proto = Object.getPrototypeOf(proto);
+        }
+        try {
+            if (setter) setter.call(el, s); else el.value = s;
+        } catch (e) {
+            try { el.value = s; } catch (_) { return false; }
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        return true;
+    }
+
+    function clickEl(el) {
+        if (!el) return false;
+        try { el.focus({ preventScroll: true }); } catch (_) {}
+        try { el.click(); return true; } catch (_) { return false; }
+    }
+
+    function dispatchRealisticClick(el) {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const view = el.ownerDocument.defaultView || window;
+        const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+        try { el.focus({ preventScroll: true }); } catch (_) {}
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            const isPointer = type.startsWith('pointer');
+            const isDown = type.endsWith('down');
+            const Ctor = (isPointer && view.PointerEvent) ? view.PointerEvent : view.MouseEvent;
+            try {
+                el.dispatchEvent(new Ctor(type, {
+                    bubbles: true, cancelable: true, composed: true, view,
+                    clientX: x, clientY: y, button: 0,
+                    buttons: isDown ? 1 : 0, pointerType: 'mouse', isPrimary: true
+                }));
+            } catch (_) {}
+        }
+        return true;
+    }
+
+    function pressEnter(el) {
+        if (!el) return;
+        for (const type of ['keydown', 'keyup']) {
+            try {
+                el.dispatchEvent(new KeyboardEvent(type, {
+                    key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                    bubbles: true, cancelable: true
+                }));
+            } catch (_) {}
+        }
+    }
+
+    function normalizeSku(v) {
+        const d = String(v || '').trim().replace(/\D/g, '');
+        return d ? String(parseInt(d, 10)) : '';
+    }
+    function normalizeUom(v) { return String(v || '').trim().toUpperCase(); }
+    function normalizeQty(v) {
+        if (v === null || v === undefined) return '';
+        const s = String(v).trim().replace(/,/g, '');
+        if (!s) return '';
+        const n = Number(s);
+        return Number.isNaN(n) ? s : String(n);
+    }
+    function qtyMatches(actual, wanted) {
+        const a = parseFloat(actual), w = parseFloat(wanted);
+        if (!Number.isNaN(a) && !Number.isNaN(w)) return Math.abs(a - w) < 1e-9;
+        return normalizeQty(actual) === normalizeQty(wanted);
+    }
+
+    // ============================================================
+    // UI
+    // ============================================================
+
     const style = document.createElement('style');
     style.textContent = `
-        #reqFillerPanel {
-            position: fixed;
-            top: 80px;
-            right: 20px;
-            width: 340px;
-            background: #1e1f29;
-            color: #f8f8f2;
-            border: 1px solid #44475a;
-            border-radius: 10px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.45);
-            z-index: 999999;
-            font-family: "Segoe UI", Arial, sans-serif;
-            font-size: 13px;
-            overflow: hidden;
-        }
-        #reqFillerHeader {
-            background: #282a36;
-            padding: 8px 12px;
-            cursor: move;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid #44475a;
-            user-select: none;
-        }
+        #reqFillerPanel { position: fixed; top: 80px; right: 20px; width: 360px;
+            background: #1e1f29; color: #f8f8f2; border: 1px solid #44475a; border-radius: 10px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.45); z-index: 999999;
+            font-family: "Segoe UI", Arial, sans-serif; font-size: 13px; overflow: hidden; }
+        #reqFillerHeader { background: #282a36; padding: 8px 12px; cursor: move;
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 1px solid #44475a; user-select: none; }
         #reqFillerHeader span { font-weight: 600; color: #bd93f9; }
-        #reqFillerHeader button {
-            background: none; border: none; color: #f8f8f2;
-            cursor: pointer; font-size: 15px; line-height: 1;
-        }
+        #reqFillerHeader button { background: none; border: none; color: #f8f8f2;
+            cursor: pointer; font-size: 15px; line-height: 1; }
         #reqFillerBody { padding: 10px 12px; }
-        #reqFillerBody textarea {
-            width: 100%; height: 150px; resize: vertical;
-            background: #282a36; color: #f8f8f2;
-            border: 1px solid #44475a; border-radius: 6px;
-            padding: 6px; box-sizing: border-box; font-family: monospace;
-            font-size: 11.5px;
-        }
+        #reqFillerBody textarea { width: 100%; height: 150px; resize: vertical;
+            background: #282a36; color: #f8f8f2; border: 1px solid #44475a; border-radius: 6px;
+            padding: 6px; box-sizing: border-box; font-family: monospace; font-size: 11.5px; }
         .reqFillerBtnRow { display: flex; gap: 6px; margin-top: 8px; }
-        .reqFillerBtnRow button {
-            flex: 1; padding: 7px 6px; border: none; border-radius: 6px;
-            cursor: pointer; font-weight: 600; font-size: 12px;
-        }
-        #reqFillerOpenFilter { background: #8be9fd; color: #1e1f29; }
-        #reqFillerOpenFilter:hover { background: #a4eeff; }
+        .reqFillerBtnRow button { flex: 1; padding: 7px 6px; border: none; border-radius: 6px;
+            cursor: pointer; font-weight: 600; font-size: 12px; }
         #reqFillerGenerate { background: #50fa7b; color: #1e1f29; }
         #reqFillerGenerate:hover { background: #6bffa0; }
+        #reqFillerStop { background: #ff5555; color: #1e1f29; display: none; }
         #reqFillerClear { background: #44475a; color: #f8f8f2; }
         #reqFillerClear:hover { background: #565a70; }
-        #reqFillerStatus {
-            margin-top: 8px; max-height: 160px; overflow-y: auto;
+        #reqFillerStatus { margin-top: 8px; max-height: 190px; overflow-y: auto;
             background: #14151c; border: 1px solid #44475a; border-radius: 6px;
-            padding: 6px 8px; font-family: monospace; font-size: 11px;
-            line-height: 1.5; white-space: pre-wrap;
-        }
+            padding: 6px 8px; font-family: monospace; font-size: 11px; line-height: 1.5;
+            white-space: pre-wrap; }
         #reqFillerStatus .ok { color: #50fa7b; }
         #reqFillerStatus .warn { color: #f1fa8c; }
         #reqFillerStatus .err { color: #ff5555; }
-        #reqFillerToggleBtn {
-            position: fixed; top: 80px; right: 20px; z-index: 999998;
-            background: #bd93f9; color: #1e1f29; border: none;
-            padding: 8px 12px; border-radius: 8px; font-weight: 700;
-            cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-        }
+        #reqFillerStatus .info { color: #8be9fd; }
+        #reqFillerToggleBtn { position: fixed; top: 80px; right: 20px; z-index: 999998;
+            background: #bd93f9; color: #1e1f29; border: none; padding: 8px 12px;
+            border-radius: 8px; font-weight: 700; cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
     `;
     document.head.appendChild(style);
 
@@ -199,18 +316,22 @@
     panel.id = 'reqFillerPanel';
     panel.innerHTML = `
         <div id="reqFillerHeader">
-            <span>REQ SKU/Qty Filler</span>
+            <span>REQ SKU/Qty Filler v4</span>
             <button id="reqFillerHide" title="Minimize">&minus;</button>
         </div>
         <div id="reqFillerBody">
-            <textarea id="reqFillerInput" placeholder="Paste rows here, e.g.&#10;32746&#9;FRUIT - AMBARELLA&#9; 6.000 &#9;KG&#10;16308&#9;FRUIT - PINEAPPLE&#9; 40.000 &#9;KG"></textarea>
+            <textarea id="reqFillerInput" placeholder="Paste rows here, e.g.
+
+32746    FRUIT - AMBARELLA    6.000    KG
+16308    FRUIT - PINEAPPLE   40.000   KG
+"></textarea>
             <div class="reqFillerBtnRow">
                 <button id="reqFillerClear">Clear</button>
+                <button id="reqFillerStop">Stop</button>
                 <button id="reqFillerGenerate" style="flex:2;">Generate</button>
             </div>
-            <div id="reqFillerStatus">Paste your data, then click Generate.</div>
-        </div>
-    `;
+            <div id="reqFillerStatus">Ready.</div>
+        </div>`;
     document.body.appendChild(panel);
 
     const toggleBtn = document.createElement('button');
@@ -220,26 +341,22 @@
     document.body.appendChild(toggleBtn);
 
     document.getElementById('reqFillerHide').addEventListener('click', () => {
-        panel.style.display = 'none';
-        toggleBtn.style.display = 'block';
+        panel.style.display = 'none'; toggleBtn.style.display = 'block';
     });
     toggleBtn.addEventListener('click', () => {
-        panel.style.display = 'block';
-        toggleBtn.style.display = 'none';
+        panel.style.display = 'block'; toggleBtn.style.display = 'none';
     });
 
-    // Draggable header
     (function makeDraggable() {
         const header = document.getElementById('reqFillerHeader');
         let dragging = false, offsetX = 0, offsetY = 0;
-        header.addEventListener('mousedown', (e) => {
+        header.addEventListener('mousedown', e => {
             if (e.target.tagName === 'BUTTON') return;
             dragging = true;
             const rect = panel.getBoundingClientRect();
-            offsetX = e.clientX - rect.left;
-            offsetY = e.clientY - rect.top;
+            offsetX = e.clientX - rect.left; offsetY = e.clientY - rect.top;
         });
-        document.addEventListener('mousemove', (e) => {
+        document.addEventListener('mousemove', e => {
             if (!dragging) return;
             panel.style.left = (e.clientX - offsetX) + 'px';
             panel.style.top = (e.clientY - offsetY) + 'px';
@@ -249,206 +366,118 @@
     })();
 
     const statusEl = document.getElementById('reqFillerStatus');
-    function log(msg, kind = '') {
+    function log(message, kind = '') {
         const line = document.createElement('div');
         if (kind) line.className = kind;
-        line.textContent = msg;
+        line.textContent = message;
         statusEl.appendChild(line);
         statusEl.scrollTop = statusEl.scrollHeight;
     }
-    function clearLog() {
-        statusEl.innerHTML = '';
-    }
+    function clearLog() { statusEl.innerHTML = ''; }
 
+    let aborted = false;
     document.getElementById('reqFillerClear').addEventListener('click', () => {
         document.getElementById('reqFillerInput').value = '';
         clearLog();
-        log('Cleared. Paste new data and click Generate.');
+        log('Cleared. Paste your data and click Generate.', 'info');
+    });
+    document.getElementById('reqFillerStop').addEventListener('click', () => {
+        aborted = true;
+        log('Stop requested — finishing current row...', 'warn');
     });
 
     // ============================================================
-    // Generic helpers
+    // GRID / FRAME DISCOVERY  (cached; refreshed only when stale)
     // ============================================================
-    const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-    // Properly set a value on a React/Angular-controlled input so the
-    // framework's change detection actually picks it up.
-    function setNativeValue(el, value) {
-        const proto = Object.getPrototypeOf(el);
-        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (desc && desc.set) {
-            desc.set.call(el, value);
-        } else {
-            el.value = value;
-        }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-
-    function isVisible(el) {
-        return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-    }
-
-    function clickEl(el) {
-        // Using the browser's native click() instead of manually dispatching
-        // mousedown/mouseup/click as separate synthetic events. Kept for the
-        // plain qty-cell/input-commit flow, where a single 'click' event is
-        // enough. NOT used for anything that opens a popup/dialog or drives
-        // ag-grid row selection — see dispatchRealisticClick() below for those.
-        el.focus({ preventScroll: true });
-        el.click();
-    }
-
-    // Fuller, coordinate-correct pointer/mouse event sequence (pointerdown, mousedown,
-    // pointerup, mouseup, click) instead of just el.click(). Plain .click() only ever
-    // fires a single 'click' event — it never fires mousedown/mouseup/pointerdown/up —
-    // so any UI code that opens/tracks a popup or drives row-selection based on those
-    // events (common for dropdown/menu widgets and ag-grid row selection) can behave
-    // differently than it does for a real click. This can't fake event.isTrusted (no
-    // page script can), but it gets much closer to what a real click actually
-    // dispatches, which is what these widgets typically listen for. Confirmed needed
-    // for: the Part # filter menu button, the Req UOM cell's zoom button, selecting a
-    // row in the UOM picker dialog, and the picker's Select/Close buttons — a plain
-    // click() on any of those either failed to open the popup or failed to register
-    // the row as selected, which is why the UOM correction wasn't sticking.
-    function dispatchRealisticClick(el) {
-        const rect = el.getBoundingClientRect();
-        const x = rect.left + rect.width / 2;
-        const y = rect.top + rect.height / 2;
-        const view = el.ownerDocument.defaultView || window;
-
-        try { el.focus({ preventScroll: true }); } catch (e) { /* not focusable, ignore */ }
-
-        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
-            const isDown = type.endsWith('down');
-            const isPointerType = type.startsWith('pointer');
-            const EventCtor = (isPointerType && view.PointerEvent) ? view.PointerEvent : view.MouseEvent;
-            const evt = new EventCtor(type, {
-                bubbles: true,
-                cancelable: true,
-                composed: true,
-                view,
-                clientX: x,
-                clientY: y,
-                button: 0,
-                buttons: isDown ? 1 : 0,
-                pointerType: 'mouse',
-                isPrimary: true
-            });
-            el.dispatchEvent(evt);
-        });
-    }
-
-    // Normalize a SKU string for comparison — strips leading zeros so
-    // "32746" matches the grid's "000000000032746"
-    function normalizeSku(str) {
-        const digits = String(str).trim().replace(/\D/g, '');
-        if (!digits) return '';
-        return String(parseInt(digits, 10));
-    }
-
-    // Normalize a UOM string for comparison — trims and uppercases so
-    // "btl" / "Btl" / "BTL " all compare equal.
-    function normalizeUom(str) {
-        return String(str || '').trim().toUpperCase();
-    }
-
-    // ============================================================
-    // Find the document that actually contains the RIGHT ag-grid.
-    // IMPORTANT: this page can have more than one ag-grid instance at once
-    // (e.g. a small item-search grid sharing the same generic id="myGrid"
-    // alongside the real Order Sheet grid). We can't just grab the first
-    // .ag-root we find — we specifically require a "Quantity" column header,
-    // since that's what distinguishes the real Order Sheet grid from any
-    // other grid-like widget on the page.
-    // ============================================================
-    let gridDoc = null;
+    let gridDoc = null, gridFrame = null;
+    let resolvedSkuColId = null, resolvedQtyColId = null, resolvedUomColId = null;
 
     function docHasGrid(doc) {
-        try {
-            return !!doc.querySelector('.ag-root, #myGrid, .ag-center-cols-container');
-        } catch (e) {
-            return false;
-        }
+        if (!doc) return false;
+        try { return !!doc.querySelector('.ag-root, #myGrid, .ag-center-cols-container'); }
+        catch (_) { return false; }
     }
 
     function docHasQuantityColumn(doc) {
+        if (!doc) return false;
         try {
-            const headerTexts = Array.from(doc.querySelectorAll('.ag-header-cell-text'));
-            return headerTexts.some(span => CONFIG.QTY_HEADER_TEXT.test(span.textContent.trim()));
-        } catch (e) {
-            return false;
-        }
+            return Array.from(doc.querySelectorAll('.ag-header-cell-text'))
+                .some(s => CONFIG.QTY_HEADER_TEXT.test(s.textContent.trim()));
+        } catch (_) { return false; }
     }
 
-    // Collects every document on the page (main + same-origin iframes, recursively)
-    // that contains an ag-grid, so we can pick the best one rather than the first one.
-    function collectGridDocuments(doc, visited, results) {
-        if (!doc || visited.has(doc)) return;
-        visited.add(doc);
-
-        if (docHasGrid(doc)) results.push(doc);
-
-        let frames = [];
+    function findOrderSheetTabFrame(root) {
+        const doc = root || document;
+        let frame = null;
         try {
-            frames = Array.from(doc.querySelectorAll('iframe, frame'));
-        } catch (e) {
-            return;
-        }
-
-        for (const frameEl of frames) {
-            let innerDoc = null;
-            try {
-                innerDoc = frameEl.contentDocument || (frameEl.contentWindow && frameEl.contentWindow.document);
-            } catch (e) {
-                continue; // cross-origin — can't access, skip
-            }
-            collectGridDocuments(innerDoc, visited, results);
-        }
+            frame = doc.querySelector(`iframe[name="${ORDER_SHEET_FRAME_NAME}"], iframe#${ORDER_SHEET_FRAME_NAME}, frame[name="${ORDER_SHEET_FRAME_NAME}"], frame#${ORDER_SHEET_FRAME_NAME}`);
+        } catch (_) { frame = null; }
+        if (!frame) return null;
+        let innerDoc = null;
+        try {
+            innerDoc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+        } catch (_) { innerDoc = null; }
+        if (!innerDoc) return null;
+        if (docHasGrid(innerDoc)) return { doc: innerDoc, frame };
+        return findOrderSheetTabFrame(innerDoc);
     }
 
-    function ensureGridDoc() {
-        // Reuse the cached doc if it's still valid AND still has the Quantity column
-        if (gridDoc && docHasGrid(gridDoc) && docHasQuantityColumn(gridDoc)) return gridDoc;
-
-        const candidates = [];
-        collectGridDocuments(document, new Set(), candidates);
-
-        if (candidates.length === 0) {
-            gridDoc = null;
-            log('Could not locate any ag-grid (checked main page and same-origin iframes).', 'err');
-            return null;
-        }
-
-        // Prefer a candidate that actually has the Quantity column — that's the real Order Sheet.
-        const best = candidates.find(docHasQuantityColumn) || candidates[0];
-
-        if (best !== gridDoc) {
-            if (!docHasQuantityColumn(best)) {
-                log(`Found ${candidates.length} grid(s) on the page, but none has a "Quantity" column — using the first one, results may be wrong.`, 'warn');
-            } else if (candidates.length > 1) {
-                log(`Found ${candidates.length} grid(s) on the page — using the one with a "Quantity" column (the Order Sheet).`, 'ok');
-            } else {
-                log(best === document ? 'Grid found in the main page.' : 'Grid found inside an iframe — operating there.', 'ok');
+    function discoverGridDocuments() {
+        const named = findOrderSheetTabFrame(document);
+        if (named) return [named];
+        // Fallback: exhaustive search
+        const results = [], visited = new Set();
+        (function collect(doc) {
+            if (!doc || visited.has(doc)) return;
+            visited.add(doc);
+            try { if (docHasGrid(doc)) results.push({ doc, frame: null }); } catch (_) {}
+            let frames = [];
+            try { frames = Array.from(doc.querySelectorAll('iframe, frame')); } catch (_) {}
+            for (const f of frames) {
+                let d = null;
+                try { d = f.contentDocument || (f.contentWindow && f.contentWindow.document); } catch (_) { continue; }
+                if (d && !visited.has(d)) collect(d);
             }
+        })(document);
+        return results;
+    }
+
+    // Full re-discovery — only call when the cached doc is provably stale.
+    function rediscoverGridDoc() {
+        const candidates = discoverGridDocuments();
+        if (candidates.length === 0) { gridDoc = null; gridFrame = null; return null; }
+        const best = candidates.find(c => docHasQuantityColumn(c.doc)) || candidates[0];
+        const changed = best.doc !== gridDoc;
+        gridDoc = best.doc; gridFrame = best.frame;
+        if (changed) {
+            resolvedSkuColId = null; resolvedQtyColId = null; resolvedUomColId = null;
+            log('Reconnected to current Order Sheet document.', 'info');
         }
-        gridDoc = best;
         return gridDoc;
     }
 
-    // ============================================================
-    // Dynamic column detection (col-ids can differ per session/report)
-    // ============================================================
-    let resolvedSkuColId = null;
-    let resolvedQtyColId = null;
-    let resolvedUomColId = null;
+    // Cheap check: cached doc still good? Only if not, do full rediscovery.
+    function ensureGridDoc() {
+        if (gridDoc && gridFrame) {
+            let cur = null;
+            try {
+                cur = gridFrame.contentDocument || (gridFrame.contentWindow && gridFrame.contentWindow.document);
+            } catch (_) { cur = null; }
+            if (cur && cur === gridDoc && docHasGrid(cur)) return gridDoc;
+        } else if (gridDoc && !gridFrame) {
+            if (docHasGrid(gridDoc)) return gridDoc;
+        }
+        return rediscoverGridDoc();
+    }
 
     function findColIdByHeaderText(doc, regex) {
-        const headerTexts = Array.from(doc.querySelectorAll('.ag-header-cell-text'));
-        for (const span of headerTexts) {
+        if (!doc) return null;
+        const spans = Array.from(doc.querySelectorAll('.ag-header-cell-text'));
+        for (const span of spans) {
             if (regex.test(span.textContent.trim())) {
-                const headerCell = span.closest('.ag-header-cell');
-                if (headerCell) return headerCell.getAttribute('col-id');
+                const header = span.closest('.ag-header-cell');
+                if (header) return header.getAttribute('col-id');
             }
         }
         return null;
@@ -456,459 +485,312 @@
 
     function resolveColumnIds() {
         const doc = ensureGridDoc();
-        if (!doc) {
-            resolvedSkuColId = resolvedSkuColId || CONFIG.SKU_COL_ID_FALLBACK;
-            resolvedQtyColId = resolvedQtyColId || CONFIG.QTY_COL_ID_FALLBACK;
-            resolvedUomColId = resolvedUomColId || CONFIG.UOM_COL_ID_FALLBACK;
-            return { skuColId: resolvedSkuColId, qtyColId: resolvedQtyColId, uomColId: resolvedUomColId };
-        }
-
-        const foundSku = findColIdByHeaderText(doc, CONFIG.SKU_HEADER_TEXT);
-        const foundQty = findColIdByHeaderText(doc, CONFIG.QTY_HEADER_TEXT);
-        const foundUom = findColIdByHeaderText(doc, CONFIG.UOM_HEADER_TEXT);
-
-        if (foundSku) {
-            if (foundSku !== resolvedSkuColId) log(`Detected Part # column (col-id="${foundSku}").`, 'ok');
-            resolvedSkuColId = foundSku;
-        } else if (!resolvedSkuColId) {
-            log(`Could not detect the Part # column by header text — falling back to col-id="${CONFIG.SKU_COL_ID_FALLBACK}".`, 'warn');
-            resolvedSkuColId = CONFIG.SKU_COL_ID_FALLBACK;
-        }
-
-        if (foundQty) {
-            if (foundQty !== resolvedQtyColId) log(`Detected Quantity column (col-id="${foundQty}").`, 'ok');
-            resolvedQtyColId = foundQty;
-        } else if (!resolvedQtyColId) {
-            log(`Could not detect the Quantity column by header text — falling back to col-id="${CONFIG.QTY_COL_ID_FALLBACK}".`, 'warn');
-            resolvedQtyColId = CONFIG.QTY_COL_ID_FALLBACK;
-        }
-
-        if (foundUom) {
-            if (foundUom !== resolvedUomColId) log(`Detected Req UOM column (col-id="${foundUom}").`, 'ok');
-            resolvedUomColId = foundUom;
-        } else if (!resolvedUomColId) {
-            log(`Could not detect the Req UOM column by header text — falling back to col-id="${CONFIG.UOM_COL_ID_FALLBACK}".`, 'warn');
-            resolvedUomColId = CONFIG.UOM_COL_ID_FALLBACK;
-        }
-
-        return { skuColId: resolvedSkuColId, qtyColId: resolvedQtyColId, uomColId: resolvedUomColId };
+        const out = {
+            skuColId: resolvedSkuColId || CONFIG.SKU_COL_ID_FALLBACK,
+            qtyColId: resolvedQtyColId || CONFIG.QTY_COL_ID_FALLBACK,
+            uomColId: resolvedUomColId || CONFIG.UOM_COL_ID_FALLBACK
+        };
+        if (!doc) return out;
+        const sku = findColIdByHeaderText(doc, CONFIG.SKU_HEADER_TEXT);
+        const qty = findColIdByHeaderText(doc, CONFIG.QTY_HEADER_TEXT);
+        const uom = findColIdByHeaderText(doc, CONFIG.UOM_HEADER_TEXT);
+        if (sku) { if (resolvedSkuColId !== sku) log(`Part # column: ${sku}`, 'ok'); resolvedSkuColId = sku; out.skuColId = sku; }
+        if (qty) { if (resolvedQtyColId !== qty) log(`Quantity column: ${qty}`, 'ok'); resolvedQtyColId = qty; out.qtyColId = qty; }
+        if (uom) { if (resolvedUomColId !== uom) log(`Req UOM column: ${uom}`, 'ok'); resolvedUomColId = uom; out.uomColId = uom; }
+        return out;
     }
 
     // ============================================================
-    // Parsing pasted data (tab-separated, or Excel-style multi-space)
-    // Expected columns: SKU, Description, Qty, UOM
-    // ============================================================
-    function parseInput(raw) {
-        const lines = raw.split('\n');
-        const rows = [];
-        for (const rawLine of lines) {
-            const line = rawLine.trim();
-            if (!line) continue;
-
-            let cols = line.split('\t').map(c => c.trim());
-            if (cols.length < 4) {
-                cols = line.split(/\s{2,}/).map(c => c.trim());
-            }
-            if (cols.length < 4) continue;
-
-            const skuRaw = cols[0].trim();
-            const descRaw = (cols[1] || '').trim();
-            const qtyRaw = cols[2].trim();
-            const uomRaw = (cols[3] || '').trim();
-
-            if (/^item\s*sku$/i.test(skuRaw)) continue; // skip header row
-            const sku = normalizeSku(skuRaw);
-            if (!sku) continue;
-
-            const qtyNum = parseFloat(qtyRaw.replace(/,/g, ''));
-            if (isNaN(qtyNum)) continue;
-
-            rows.push({ sku, qty: qtyNum, description: descRaw, uom: normalizeUom(uomRaw) });
-        }
-        return rows;
-    }
-
-    // ============================================================
-    // Optional convenience: auto-open the Part# filter popup
-    // ============================================================
-    function findVisibleFilterInput() {
-        const doc = ensureGridDoc();
-        if (!doc) return null;
-        const candidates = Array.from(doc.querySelectorAll(CONFIG.FILTER_INPUT_SELECTOR));
-        return candidates.find(el =>
-            isVisible(el) &&
-            (!CONFIG.FILTER_INPUT_PLACEHOLDER || el.placeholder === CONFIG.FILTER_INPUT_PLACEHOLDER)
-        );
-    }
-
-    // One open attempt: click the menu icon, then only if the filter input still isn't
-    // visible do we go looking for a separate "Filter" tab to click — scoped to the
-    // popup that's actually open right now, so we never click something unrelated that
-    // could itself be the thing closing the popup.
-    async function attemptOpenFilterMenu(doc, header) {
-        const menuBtn = header.querySelector('[ref="eMenu"], .ag-header-cell-menu-button');
-        if (!menuBtn) {
-            log('Could not find the filter/menu icon on the Part # header.', 'warn');
-            return false;
-        }
-
-        dispatchRealisticClick(menuBtn);
-        await sleep(CONFIG.FILTER_OPEN_CHECK_DELAY_MS);
-
-        if (findVisibleFilterInput()) return true;
-
-        const openPopup = doc.querySelector('.ag-popup:not(.ag-hidden) .ag-menu, .ag-popup .ag-menu');
-        if (openPopup) {
-            const filterTabIcon = openPopup.querySelector('.ag-tab-selector .ag-icon-filter, .ag-menu-header .ag-icon-filter, [aria-label="Filter"]');
-            if (filterTabIcon) {
-                const clickable = filterTabIcon.closest('span, button, div');
-                if (clickable) {
-                    dispatchRealisticClick(clickable);
-                    await sleep(200);
-                    if (findVisibleFilterInput()) return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    async function openPartNumberFilter() {
-        const doc = ensureGridDoc();
-        if (!doc) return false;
-
-        const { skuColId } = resolveColumnIds();
-        const header = doc.querySelector(`.ag-header-cell[col-id="${skuColId}"]`);
-        if (!header) {
-            log('Could not find the Part # column header.', 'err');
-            return false;
-        }
-
-        for (let attempt = 1; attempt <= CONFIG.FILTER_OPEN_RETRY_ATTEMPTS; attempt++) {
-            const opened = await attemptOpenFilterMenu(doc, header);
-            if (opened) {
-                log('Part # filter panel is open.', 'ok');
-                return true;
-            }
-            if (attempt < CONFIG.FILTER_OPEN_RETRY_ATTEMPTS) {
-                log(`Filter popup closed before it could be used (attempt ${attempt}/${CONFIG.FILTER_OPEN_RETRY_ATTEMPTS}) — retrying...`, 'warn');
-                await sleep(CONFIG.FILTER_OPEN_RETRY_DELAY_MS);
-            }
-        }
-
-        log('The filter popup isn\'t staying open on its own — open it manually with a real click, then click Generate.', 'warn');
-        return false;
-    }
-
-    // ============================================================
-    // Step 1: Fill the ag-grid filter input with comma-joined SKUs
-    // ============================================================
-    function findVisibleApplyButton() {
-        const doc = ensureGridDoc();
-        if (!doc) return null;
-        // NOTE: the filter popup has both "Clear Filter" and "Apply Filter" buttons
-        // sharing the exact same CSS classes, so we must match by text, not just class/order.
-        const candidates = Array.from(doc.querySelectorAll(CONFIG.APPLY_BUTTON_SELECTOR));
-        let btn = candidates.find(el => isVisible(el) && /^apply filter$/i.test(el.textContent.trim()));
-        if (!btn) {
-            btn = Array.from(doc.querySelectorAll('button')).find(
-                b => isVisible(b) && /apply filter/i.test(b.textContent)
-            );
-        }
-        return btn;
-    }
-
-    async function fillFilterAndApply(skuList) {
-        let input = findVisibleFilterInput();
-
-        if (!input) {
-            log('Filter input not visible yet — trying to auto-open the Part # filter...', 'warn');
-            await openPartNumberFilter();
-            input = findVisibleFilterInput();
-        }
-
-        if (!input) {
-            log('Still could not find the filter input. Open the Part # column filter manually, then click Generate again.', 'err');
-            return false;
-        }
-
-        const joined = skuList.join(',');
-        setNativeValue(input, joined);
-        log(`Filter input filled with ${skuList.length} SKUs.`, 'ok');
-
-        await sleep(100);
-
-        const applyBtn = findVisibleApplyButton();
-        if (!applyBtn) {
-            log('Could not find the Apply Filter button.', 'err');
-            return false;
-        }
-        clickEl(applyBtn);
-        log('Clicked Apply Filter.', 'ok');
-        return true;
-    }
-
-    // ============================================================
-    // Step 2: Walk filtered rows and fill in quantities, top-to-bottom.
-    // Confirmed behavior from a real recording: a single click on the
-    // quantity cell swaps it to <input id="QUANTITY{row-index}">, and
-    // clicking elsewhere commits the value.
+    // ROW / VIEWPORT HELPERS
     // ============================================================
 
-    // IMPORTANT: ag-grid recycles row DOM nodes for virtual scrolling, so the
-    // order nodes appear in the container's child list does NOT reliably match
-    // their visual top-to-bottom row-index order. We must sort by row-index
-    // ourselves to guarantee first-row-to-last-row processing.
     function getGridRows() {
         const doc = ensureGridDoc();
         if (!doc) return [];
         const container = doc.querySelector(CONFIG.ROW_CONTAINER_SELECTOR);
         if (!container) return [];
-        const rows = Array.from(container.querySelectorAll(`:scope > ${CONFIG.ROW_SELECTOR}`));
-        rows.sort((a, b) => {
+        return Array.from(container.querySelectorAll(':scope > .ag-row')).sort((a, b) => {
             const ai = parseInt(a.getAttribute('row-index'), 10);
             const bi = parseInt(b.getAttribute('row-index'), 10);
-            return (isNaN(ai) ? 0 : ai) - (isNaN(bi) ? 0 : bi);
+            return (Number.isNaN(ai) ? 0 : ai) - (Number.isNaN(bi) ? 0 : bi);
         });
-        return rows;
     }
 
     function getSkuFromRow(row) {
+        if (!row) return null;
         const cell = row.querySelector(`${CONFIG.CELL_SELECTOR}[col-id="${resolvedSkuColId}"]`);
-        if (!cell) return null;
-        return normalizeSku(cell.textContent);
+        return cell ? normalizeSku(cell.textContent) : null;
     }
-
     function getQtyCellFromRow(row) {
-        return row.querySelector(`${CONFIG.CELL_SELECTOR}[col-id="${resolvedQtyColId}"]`);
+        return row ? row.querySelector(`${CONFIG.CELL_SELECTOR}[col-id="${resolvedQtyColId}"]`) : null;
     }
-
     function getUomCellFromRow(row) {
-        return row.querySelector(`${CONFIG.CELL_SELECTOR}[col-id="${resolvedUomColId}"]`);
+        return row ? row.querySelector(`${CONFIG.CELL_SELECTOR}[col-id="${resolvedUomColId}"]`) : null;
+    }
+    function findRowBySku(sku) {
+        const n = normalizeSku(sku);
+        return getGridRows().find(r => getSkuFromRow(r) === n) || null;
     }
 
-    // Reads the grid's current Req UOM for a row (ignoring any flag/marker we previously
-    // added ourselves) and compares it against the pasted UOM.
+    function getGridViewport() {
+        const doc = ensureGridDoc();
+        if (!doc) return null;
+        const candidates = Array.from(doc.querySelectorAll(CONFIG.GRID_VIEWPORT_SELECTOR));
+        return candidates.find(el => el.scrollHeight > el.clientHeight + 5) || candidates[0] || null;
+    }
+
+    async function scrollViewportBy(amount) {
+        const vp = getGridViewport();
+        if (!vp) return { didScroll: false, atBottom: true, after: 0 };
+        const before = vp.scrollTop;
+        vp.scrollTop = Math.max(0, Math.min(vp.scrollHeight, vp.scrollTop + amount));
+        try { vp.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+        await waitFor(() => {
+            const rows = getGridRows();
+            return rows.length > 0;
+        }, CONFIG.SCROLL_RENDER_DELAY_MS, CONFIG.POLL_FAST_MS);
+        const after = vp.scrollTop;
+        const atBottom = after + vp.clientHeight >= vp.scrollHeight - 5;
+        return { didScroll: after !== before, atBottom, after };
+    }
+
+    async function scrollViewportTo(top) {
+        const vp = getGridViewport();
+        if (!vp) return;
+        vp.scrollTop = top;
+        try { vp.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+        await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
+    }
+
+    // Minimal nudge so the cell is comfortably inside the viewport.
+    // Never recenters the whole grid the way scrollIntoView did.
+    async function ensureCellVisible(row, getCell) {
+        const vp = getGridViewport();
+        if (!vp) return row;
+        let cell = getCell(row);
+        if (!cell) return row;
+        const cellRect = cell.getBoundingClientRect();
+        const vpRect = vp.getBoundingClientRect();
+        const MARGIN = 40;
+        let delta = 0;
+        if (cellRect.top < vpRect.top + MARGIN) delta = cellRect.top - vpRect.top - MARGIN;
+        else if (cellRect.bottom > vpRect.bottom - MARGIN) delta = cellRect.bottom - vpRect.bottom + MARGIN;
+        if (delta !== 0) {
+            vp.scrollTop += delta;
+            try { vp.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+            await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
+        }
+        return row; // caller re-reads cells from the row it already holds
+    }
+
+    // Locate a row by scrolling: prefer DOWN from current position (normal
+    // processing order), then a full sweep from the top (recovery).
+    async function locateRowWithScrolling(sku) {
+        const n = normalizeSku(sku);
+        let row = findRowBySku(n);
+        if (row) return row;
+
+        const vp = getGridViewport();
+        if (!vp) return null;
+
+        // Phase 1: downward scan
+        let lastTop = -1;
+        for (let i = 0; i < 60; i++) {
+            row = findRowBySku(n);
+            if (row) return row;
+            const before = vp.scrollTop;
+            if (before === lastTop && i > 0) break;
+            lastTop = before;
+            vp.scrollTop = Math.min(vp.scrollHeight, before + 350);
+            try { vp.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+            await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
+            if (vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 5) {
+                row = findRowBySku(n);
+                if (row) return row;
+                break;
+            }
+        }
+
+        // Phase 2: full sweep from the top
+        vp.scrollTop = 0;
+        try { vp.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+        await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
+        row = findRowBySku(n);
+        if (row) return row;
+        lastTop = -1;
+        for (let i = 0; i < 120; i++) {
+            row = findRowBySku(n);
+            if (row) return row;
+            const before = vp.scrollTop;
+            if (before === lastTop && i > 0) break;
+            lastTop = before;
+            vp.scrollTop = Math.min(vp.scrollHeight, before + 500);
+            try { vp.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+            await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
+            if (vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 5) {
+                row = findRowBySku(n);
+                if (row) return row;
+                break;
+            }
+        }
+        return null;
+    }
+
+    // ============================================================
+    // UOM MARKERS (persist across AG Grid row recycling)
+    // ============================================================
+
+    const uomMarkerState = new Map();
+
+    function setUomMarkerState(sku, kind, pastedUom) {
+        if (sku) uomMarkerState.set(sku, { kind, pastedUom });
+    }
+    function clearUomMarkerState(sku) { if (sku) uomMarkerState.delete(sku); }
+
     function readUomMismatch(row, pastedUom) {
         if (!pastedUom) return { mismatch: false, gridUom: '' };
         const cell = getUomCellFromRow(row);
         if (!cell) return { mismatch: false, gridUom: '' };
-
-        const existingMarker = cell.querySelector('.reqFillerUomFlag, .reqFillerUomCorrected');
-        const baseText = existingMarker
-            ? cell.textContent.replace(existingMarker.textContent, '').trim()
-            : cell.textContent.trim();
-        const gridUom = normalizeUom(baseText);
-
+        const marker = cell.querySelector('.reqFillerUomFlag, .reqFillerUomCorrected');
+        let text = cell.textContent.trim();
+        if (marker) text = text.replace(marker.textContent, '').trim();
+        const gridUom = normalizeUom(text);
         return { mismatch: gridUom !== pastedUom, gridUom };
     }
 
-    // Removes any previously-added flag/marker (used when a re-run finds the mismatch
-    // no longer applies).
     function clearUomMarkers(row) {
         const cell = getUomCellFromRow(row);
         if (!cell) return;
         const marker = cell.querySelector('.reqFillerUomFlag, .reqFillerUomCorrected');
         if (!marker) return;
-        if (marker.classList.contains('reqFillerUomCorrected')) {
-            cell.textContent = marker.textContent;
-        } else {
-            marker.remove();
-        }
+        if (marker.classList.contains('reqFillerUomCorrected')) cell.textContent = marker.textContent;
+        else marker.remove();
     }
 
-    // corrected=true: we successfully changed the grid's Req UOM to match the pasted one —
-    //   show the (now-matching) value in red as a "this was auto-corrected" confirmation.
-    // corrected=false: couldn't correct it — append the pasted UOM in red next to the
-    //   grid's existing value, same as the original mismatch flag.
-    // IMPORTANT: `row` must be a *currently attached* row element — ag-grid recycles row
-    // DOM nodes whenever the grid refreshes (which a UOM change can trigger even when it
-    // fails partway through), so writing into a stale/detached node is a silent no-op.
-    // Callers must re-locate the row by SKU right before calling this if a dialog was
-    // opened in between.
     function markUomResult(row, pastedUom, corrected) {
         const cell = getUomCellFromRow(row);
         if (!cell) return;
-
-        const oldMarker = cell.querySelector('.reqFillerUomFlag, .reqFillerUomCorrected');
-        if (oldMarker) oldMarker.remove();
-
+        const old = cell.querySelector('.reqFillerUomFlag, .reqFillerUomCorrected');
+        if (old) old.remove();
         const marker = cell.ownerDocument.createElement('span');
-        marker.style.color = corrected ? '#50fa7b' : CONFIG.UOM_MISMATCH_COLOR;
-        marker.style.fontWeight = '700';
-
+        marker.style.fontWeight = 'bold';
         if (corrected) {
             marker.className = 'reqFillerUomCorrected';
+            marker.style.color = '#50fa7b';
             marker.textContent = cell.textContent.trim();
             cell.textContent = '';
             cell.appendChild(marker);
         } else {
             marker.className = 'reqFillerUomFlag';
+            marker.style.color = CONFIG.UOM_MISMATCH_COLOR;
+            marker.style.marginLeft = '0.3in';
             marker.textContent = ' ' + pastedUom;
+            cell.appendChild(marker);
+        }
+        setUomMarkerState(getSkuFromRow(row), corrected ? 'corrected' : 'mismatch', pastedUom);
+    }
+
+    function applyStoredUomMarker(row) {
+        const sku = getSkuFromRow(row);
+        if (!sku) return;
+        const state = uomMarkerState.get(sku);
+        if (!state) return;
+        const cell = getUomCellFromRow(row);
+        if (!cell) return;
+        if (cell.querySelector('.reqFillerUomFlag, .reqFillerUomCorrected')) return;
+        const marker = cell.ownerDocument.createElement('span');
+        marker.style.fontWeight = 'bold';
+        if (state.kind === 'corrected') {
+            marker.className = 'reqFillerUomCorrected';
+            marker.style.color = '#50fa7b';
+            marker.textContent = cell.textContent.trim();
+            cell.textContent = '';
+            cell.appendChild(marker);
+        } else if (state.kind === 'mismatch') {
+            marker.className = 'reqFillerUomFlag';
+            marker.style.color = CONFIG.UOM_MISMATCH_COLOR;
+            marker.style.marginLeft = '0.3in';
+            marker.textContent = ' ' + state.pastedUom;
             cell.appendChild(marker);
         }
     }
 
+    setInterval(() => {
+        try {
+            if (uomMarkerState.size === 0) return;
+            if (!ensureGridDoc()) return;
+            resolveColumnIds();
+            for (const row of getGridRows()) applyStoredUomMarker(row);
+        } catch (_) {}
+    }, CONFIG.UOM_MARKER_REAPPLY_INTERVAL_MS);
+
     // ============================================================
-    // Req UOM auto-correction via the UOM picker ("zoom") dialog
+    // UOM DIALOG
     // ============================================================
 
-    // Clicks the Req UOM cell to enter edit mode, then returns its zoom/search button
-    // (the input itself is disabled — only the button opens the picker). Retries the
-    // click a few times, since a single plain click can land before the cell has
-    // finished swapping into its editor and never produce a zoom button at all.
-    // Uses a plain click (not dispatchRealisticClick) — the fuller event sequence was
-    // found to make this cell's editor toggle straight back closed on some attempts.
-    async function enterUomEditMode(doc, row, rowIndex) {
-        const uomCell = getUomCellFromRow(row);
-        if (!uomCell) return null;
-
-        uomCell.scrollIntoView({ block: 'center', behavior: 'instant' });
-        await sleep(80);
-
-        const before = new Set(doc.querySelectorAll('button'));
-        let zoomBtn = null;
-
-        for (let attempt = 1; attempt <= CONFIG.FILTER_OPEN_RETRY_ATTEMPTS; attempt++) {
-            clickEl(uomCell);
-            await sleep(CONFIG.CELL_EDIT_DELAY_MS);
-
-            zoomBtn = rowIndex !== null
-                ? doc.getElementById(`${CONFIG.UOM_INPUT_ID_PREFIX}${rowIndex}${CONFIG.UOM_ZOOM_BTN_ID_SUFFIX}`)
-                : null;
-
-            if (!zoomBtn) {
-                zoomBtn = uomCell.querySelector('button');
-            }
-            if (!zoomBtn) {
-                const after = Array.from(doc.querySelectorAll('button'));
-                zoomBtn = after.find(b => !before.has(b) && isVisible(b));
-            }
-
-            if (zoomBtn && isVisible(zoomBtn)) break;
-            zoomBtn = null;
-            if (attempt < CONFIG.FILTER_OPEN_RETRY_ATTEMPTS) await sleep(CONFIG.FILTER_OPEN_RETRY_DELAY_MS);
-        }
-
-        return zoomBtn;
-    }
-
-    // jQuery UI dialogs are commonly appended to the top-level document body rather than
-    // wherever they were triggered from, so we check both the grid's own document and the
-    // top window's document (when reachable) for open ".ui-dialog[role=dialog]" elements.
     function collectDialogs(doc) {
         let dialogs = [];
         try {
             dialogs = dialogs.concat(Array.from(doc.querySelectorAll('.ui-dialog[role="dialog"]')));
-        } catch (e) { /* ignore */ }
+        } catch (_) {}
         try {
             const topDoc = doc.defaultView && doc.defaultView.top && doc.defaultView.top.document;
             if (topDoc && topDoc !== doc) {
                 dialogs = dialogs.concat(Array.from(topDoc.querySelectorAll('.ui-dialog[role="dialog"]')));
             }
-        } catch (e) { /* cross-origin top, ignore */ }
+        } catch (_) {}
         return dialogs;
     }
 
-    // Opens the UOM picker dialog and waits until a genuinely new dialog is not just
-    // visible but has picker rows actually loaded — the dialog element can appear
-    // before its own ag-grid finishes populating (or get torn down and rebuilt once
-    // the real data arrives), so grabbing it too early leaves pickUomInDialog looking
-    // at an empty grid and wrongly reporting the UOM as "not offered". Requires the
-    // same populated dialog to show up on two consecutive polls before trusting it,
-    // and retries the whole click if nothing ever stabilizes within the wait budget.
-    async function openReqUomDialog(doc, zoomBtn) {
-        for (let attempt = 1; attempt <= CONFIG.UOM_DIALOG_OPEN_RETRY_ATTEMPTS; attempt++) {
-            const beforeDialogs = new Set(collectDialogs(doc));
-            clickEl(zoomBtn);
-
-            let lastCandidate = null;
-            let stableHits = 0;
-
-            for (let i = 0; i < CONFIG.UOM_DIALOG_WAIT_ATTEMPTS; i++) {
-                await sleep(CONFIG.UOM_DIALOG_POLL_MS);
-
-                const dialogs = collectDialogs(doc);
-                const candidate = dialogs.find(d => !beforeDialogs.has(d) && isVisible(d) && getDialogRows(d).length > 0);
-
-                if (candidate && candidate === lastCandidate) {
-                    stableHits++;
-                    if (stableHits >= 2) return candidate;
-                } else if (candidate) {
-                    lastCandidate = candidate;
-                    stableHits = 1;
-                } else {
-                    lastCandidate = null;
-                    stableHits = 0;
-                }
-            }
-
-            if (attempt < CONFIG.UOM_DIALOG_OPEN_RETRY_ATTEMPTS) await sleep(CONFIG.FILTER_OPEN_RETRY_DELAY_MS);
-        }
-        return null;
-    }
-
-    // The picker's own ag-grid has several UOM-ish columns (Inventory UOM, Default Inv UOM,
-    // Default REQ UOM, Order UOM...) — we specifically want the plain "UOM" column.
-    function findDialogUomColId(dialog) {
-        const headerTexts = Array.from(dialog.querySelectorAll('.ag-header-cell-text'));
-        for (const span of headerTexts) {
-            if (CONFIG.UOM_PICKER_HEADER_TEXT.test(span.textContent.trim())) {
-                const headerCell = span.closest('.ag-header-cell');
-                if (headerCell) return headerCell.getAttribute('col-id');
-            }
-        }
-        return null;
-    }
-
     function getDialogRows(dialog) {
+        if (!dialog) return [];
         const container = dialog.querySelector('.ag-center-cols-container');
-        if (!container) return [];
-        return Array.from(container.querySelectorAll(':scope > .ag-row'));
+        return container ? Array.from(container.querySelectorAll(':scope > .ag-row')) : [];
     }
 
-    // Clicks the target row's UOM cell in the picker and confirms ag-grid actually
-    // registered the selection (the row gets "ag-row-selected", same as a real click
-    // does) before hitting Select. A plain click() here was the core bug: it fired a
-    // 'click' event but never the mousedown/mouseup pair ag-grid's selection listens
-    // for, so nothing got selected and Select had nothing to apply.
+    function findDialogUomColId(dialog) {
+        const headers = Array.from(dialog.querySelectorAll('.ag-header-cell-text'));
+        for (const span of headers) {
+            if (CONFIG.UOM_PICKER_HEADER_TEXT.test(span.textContent.trim())) {
+                const header = span.closest('.ag-header-cell');
+                if (header) return header.getAttribute('col-id');
+            }
+        }
+        return null;
+    }
+
     async function pickUomInDialog(dialog, desiredUom) {
-        const colId = findDialogUomColId(dialog);
+        const colId = await waitFor(() => findDialogUomColId(dialog), 3000, CONFIG.POLL_FAST_MS);
         if (!colId) return { ok: false, reason: 'UOM column not found in picker' };
 
-        // Poll for the matching row rather than a single-shot check — openReqUomDialog
-        // already waits for rows to exist, but rows can still be trickling in (e.g. the
-        // desired UOM's row loads a beat after the first one), so give it a bit more room.
-        let target = null;
-        for (let attempt = 0; attempt < CONFIG.UOM_DIALOG_WAIT_ATTEMPTS; attempt++) {
+        const target = await waitFor(() => {
             const rows = getDialogRows(dialog);
-            target = rows.find(r => {
+            return rows.find(r => {
                 const cell = r.querySelector(`.ag-cell[col-id="${colId}"]`);
                 return cell && normalizeUom(cell.textContent) === desiredUom;
-            });
-            if (target) break;
-            await sleep(CONFIG.UOM_DIALOG_POLL_MS);
-        }
-        if (!target) return { ok: false, reason: `"${desiredUom}" not offered in the picker list` };
+            }) || null;
+        }, 4000, CONFIG.POLL_FAST_MS);
+
+        if (!target) return { ok: false, reason: `"${desiredUom}" not offered` };
 
         const targetCell = target.querySelector(`.ag-cell[col-id="${colId}"]`) || target;
 
-        let rowSelected = false;
-        for (let attempt = 1; attempt <= CONFIG.UOM_ROW_SELECT_RETRY_ATTEMPTS; attempt++) {
+        let selected = false;
+        for (let attempt = 1; attempt <= 4 && !selected; attempt++) {
             dispatchRealisticClick(targetCell);
-            await sleep(CONFIG.UOM_ROW_SELECT_CHECK_DELAY_MS);
-            if (target.classList.contains('ag-row-selected')) {
-                rowSelected = true;
-                break;
-            }
+            selected = !!(await waitFor(
+                () => target.classList.contains('ag-row-selected'),
+                400, CONFIG.POLL_FAST_MS
+            ));
         }
-        if (!rowSelected) {
-            return { ok: false, reason: `couldn't select "${desiredUom}" row in the picker` };
-        }
+        if (!selected) return { ok: false, reason: `Could not select "${desiredUom}"` };
 
-        const selectBtn = Array.from(dialog.querySelectorAll('.ui-dialog-buttonpane button'))
-            .find(b => isVisible(b) && CONFIG.UOM_PICKER_SELECT_BUTTON_TEXT.test(b.textContent.trim()));
-        if (!selectBtn) return { ok: false, reason: 'Select button not found in picker' };
+        const selectBtn = await waitFor(() =>
+            Array.from(dialog.querySelectorAll('.ui-dialog-buttonpane button')).find(b =>
+                isVisible(b) && CONFIG.UOM_PICKER_SELECT_BUTTON_TEXT.test(b.textContent.trim())
+            ) || null, 2000, CONFIG.POLL_FAST_MS);
+
+        if (!selectBtn) return { ok: false, reason: 'Select button not found' };
 
         dispatchRealisticClick(selectBtn);
         return { ok: true };
@@ -916,361 +798,488 @@
 
     function closeDialogIfOpen(dialog) {
         if (!dialog || !isVisible(dialog)) return;
-        const closeBtn = dialog.querySelector('.ui-dialog-titlebar-close')
-            || Array.from(dialog.querySelectorAll('.ui-dialog-buttonpane button')).find(b => CONFIG.UOM_PICKER_CLOSE_BUTTON_TEXT.test(b.textContent.trim()));
+        const closeBtn = dialog.querySelector('.ui-dialog-titlebar-close') ||
+            Array.from(dialog.querySelectorAll('.ui-dialog-buttonpane button')).find(b =>
+                /^close$/i.test(b.textContent.trim()));
         if (closeBtn) dispatchRealisticClick(closeBtn);
     }
 
-    // Full flow: open the cell editor -> click the zoom button -> wait for the picker
-    // dialog -> click the matching UOM row -> click Select -> wait for the dialog to
-    // close and the grid to settle (changing Req UOM can trigger a grid refresh) ->
-    // re-read the grid's actual Req UOM and confirm it matches what we picked, instead
-    // of trusting the click sequence succeeded just because no error was thrown.
-    async function correctReqUom(doc, row, desiredUom) {
-        const rowIndex = row.getAttribute('row-index');
-        const sku = getSkuFromRow(row);
-
-        const zoomBtn = await enterUomEditMode(doc, row, rowIndex);
-        if (!zoomBtn) return { ok: false, reason: 'zoom (search) button not found on Req UOM cell' };
-
-        const dialog = await openReqUomDialog(doc, zoomBtn);
-        if (!dialog) return { ok: false, reason: 'UOM picker dialog did not open' };
-
-        const pickResult = await pickUomInDialog(dialog, desiredUom);
-        if (!pickResult.ok) {
-            closeDialogIfOpen(dialog);
-            return pickResult;
-        }
-
-        for (let i = 0; i < CONFIG.UOM_DIALOG_WAIT_ATTEMPTS; i++) {
-            await sleep(CONFIG.UOM_DIALOG_POLL_MS);
-            if (!isVisible(dialog)) break;
-        }
-
-        // The grid can refresh/re-render after a UOM change — give it time to settle
-        // before re-locating the row and reading it back.
-        await sleep(CONFIG.UOM_POST_SELECT_DELAY_MS);
-
-        const freshRows = getGridRows();
-        const relocated = sku ? freshRows.find(r => getSkuFromRow(r) === sku) : null;
-        const checkRow = relocated || row;
-        const { gridUom } = readUomMismatch(checkRow, desiredUom);
-
-        if (gridUom !== desiredUom) {
-            return { ok: false, reason: `Req UOM still reads "${gridUom}" after selecting "${desiredUom}"` };
-        }
-
-        return { ok: true };
-    }
-
-    async function editRowQuantity(row, valueStr) {
+    // Correct the Req UOM for `sku` via the zoom picker.
+    // Saves/restores scroll position; caller re-locates the row afterwards.
+    async function correctReqUom(sku, desiredUom) {
         const doc = ensureGridDoc();
-        if (!doc) return { ok: false, reason: 'grid document lost' };
+        if (!doc) return { ok: false, reason: 'grid unavailable' };
 
-        const qtyCell = getQtyCellFromRow(row);
-        if (!qtyCell) return { ok: false, reason: 'qty cell not found' };
+        const vpBefore = getGridViewport();
+        const savedScrollTop = vpBefore ? vpBefore.scrollTop : null;
 
+        let row = findRowBySku(sku);
+        if (!row) return { ok: false, reason: 'row not rendered' };
+
+        await ensureCellVisible(row, getUomCellFromRow);
+
+        const uomCell = getUomCellFromRow(row);
+        if (!uomCell) return { ok: false, reason: 'Req UOM cell not found' };
         const rowIndex = row.getAttribute('row-index');
 
-        // Scroll the row into view so ag-grid doesn't virtualize it away while we edit
-        qtyCell.scrollIntoView({ block: 'center', behavior: 'instant' });
-        await sleep(80);
-
-        // Snapshot inputs already present, to support a fallback diff if the ID pattern doesn't match
-        const before = new Set(doc.querySelectorAll('input, textarea'));
-
-        clickEl(qtyCell);
-        await sleep(CONFIG.CELL_EDIT_DELAY_MS);
-
-        // 1) Primary: the confirmed #QUANTITY{row-index} pattern
-        let editorInput = rowIndex !== null
-            ? doc.getElementById(`${CONFIG.QTY_INPUT_ID_PREFIX}${rowIndex}`)
-            : null;
-
-        // 2) Fallback: an input/textarea inside the qty cell itself
-        if (!editorInput) {
-            editorInput = qtyCell.querySelector('input, textarea');
-        }
-
-        // 3) Fallback: any input whose id starts with the QUANTITY prefix, newly appeared
-        if (!editorInput) {
-            const after = Array.from(doc.querySelectorAll(`input[id^="${CONFIG.QTY_INPUT_ID_PREFIX}"], textarea[id^="${CONFIG.QTY_INPUT_ID_PREFIX}"]`));
-            editorInput = after.find(el => !before.has(el) && isVisible(el));
-        }
-
-        // 4) Last resort: any newly appeared visible input anywhere in the grid document
-        if (!editorInput) {
-            const after = Array.from(doc.querySelectorAll('input, textarea'));
-            editorInput = after.find(el => !before.has(el) && isVisible(el));
-        }
-
-        if (!editorInput) {
-            return { ok: false, reason: 'no editor input appeared' };
-        }
-
-        setNativeValue(editorInput, valueStr);
-        await sleep(80);
-
-        // Commit by clicking elsewhere in the same row (matches the recorded "click next cell" pattern)
-        const skuCell = getSkuFromRow(row) !== null ? row.querySelector(`${CONFIG.CELL_SELECTOR}[col-id="${resolvedSkuColId}"]`) : null;
-        if (skuCell) {
-            clickEl(skuCell);
-        } else {
-            editorInput.dispatchEvent(new Event('blur', { bubbles: true }));
-        }
-
-        return { ok: true };
-    }
-
-    // Process all currently visible rows in strict top-to-bottom (row-index) order,
-    // skipping SKUs already handled in previous scrolls.
-    // Returns the SKUs that were successfully filled and those that matched but failed.
-    async function fillQuantities(dataMap, alreadyFilledSkus = new Set()) {
-        const doc = ensureGridDoc();
-        const rows = getGridRows(); // already sorted top-to-bottom by row-index
-
-        if (!doc || rows.length === 0) {
-            return { filledSkus: new Set(), foundButFailedSkus: new Set(), newRowsFound: false };
-        }
-
-        let filled = 0;
-        let unmatched = 0;
-        let skipped = 0;
-        const filledSkus = new Set();
-        const foundButFailedSkus = new Set();
-        let atLeastOneNewRow = false;
-
-        for (const row of rows) {
-            const sku = getSkuFromRow(row);
-            if (!sku) {
-                unmatched++;
-                continue;
-            }
-
-            if (alreadyFilledSkus.has(sku)) {
-                skipped++;
-                continue;
-            }
-
-            atLeastOneNewRow = true;
-
-            if (!(sku in dataMap)) {
-                unmatched++;
-                continue;
-            }
-
-            const item = dataMap[sku];
-            let workingRow = row;
-
-            const uomCheck = readUomMismatch(workingRow, item.uom);
-            if (uomCheck.mismatch) {
-                if (CONFIG.UOM_CORRECTION_ENABLED) {
-                    log(`SKU ${sku}: Req UOM is "${uomCheck.gridUom}", pasted "${item.uom}" — attempting to correct...`, 'warn');
-
-                    let correction;
-                    try {
-                        correction = await correctReqUom(doc, workingRow, item.uom);
-                    } catch (err) {
-                        correction = { ok: false, reason: `unexpected error (${err && err.message ? err.message : err})` };
-                    }
-
-                    // Re-locate the row before marking either way — a dialog open/close
-                    // can refresh the grid and recycle the DOM node `workingRow` points
-                    // to, and writing a marker into a detached node is a silent no-op.
-                    const freshRows = getGridRows();
-                    const relocated = freshRows.find(r => getSkuFromRow(r) === sku);
-                    if (relocated) workingRow = relocated;
-
-                    if (correction.ok) {
-                        markUomResult(workingRow, item.uom, true);
-                        log(`SKU ${sku}: Req UOM corrected to "${item.uom}".`, 'ok');
-                    } else {
-                        markUomResult(workingRow, item.uom, false);
-                        log(`SKU ${sku}: couldn't auto-correct Req UOM (${correction.reason}) — flagged in red instead.`, 'warn');
-                    }
-                } else {
-                    markUomResult(workingRow, item.uom, false);
+        // Enter edit mode -> zoom button appears
+        let zoomBtn = null;
+        for (let attempt = 1; attempt <= CONFIG.UOM_OPEN_RETRY_ATTEMPTS && !zoomBtn; attempt++) {
+            clickEl(uomCell);
+            zoomBtn = await waitFor(() => {
+                let b = null;
+                if (rowIndex !== null && rowIndex !== undefined) {
+                    b = doc.getElementById(`${CONFIG.UOM_INPUT_ID_PREFIX}${rowIndex}${CONFIG.UOM_ZOOM_BTN_ID_SUFFIX}`);
                 }
-            } else {
-                clearUomMarkers(workingRow);
-            }
+                if (!b) b = getUomCellFromRow(findRowBySku(sku))?.querySelector('button');
+                return (b && isVisible(b)) ? b : null;
+            }, 1500, CONFIG.POLL_FAST_MS);
+        }
+        if (!zoomBtn) return { ok: false, reason: 'Req UOM zoom button not found' };
 
-            const qtyStr = CONFIG.formatQty(item.qty);
-            const result = await editRowQuantity(workingRow, qtyStr);
+        // Open dialog (poll for a NEW visible dialog with rows)
+        let dialog = null;
+        for (let attempt = 1; attempt <= CONFIG.UOM_OPEN_RETRY_ATTEMPTS && !dialog; attempt++) {
+            const before = new Set(collectDialogs(doc));
+            clickEl(zoomBtn);
+            dialog = await waitFor(() => {
+                const d = collectDialogs(doc).find(x => !before.has(x) && isVisible(x) && getDialogRows(x).length > 0);
+                return d || null;
+            }, CONFIG.DIALOG_OPEN_TIMEOUT_MS, CONFIG.POLL_FAST_MS);
+        }
+        if (!dialog) return { ok: false, reason: 'UOM picker did not open' };
 
-            if (result.ok) {
-                filled++;
-                filledSkus.add(sku);
-                log(`SKU ${sku} -> qty ${qtyStr}`, 'ok');
-            } else {
-                foundButFailedSkus.add(sku);
-                log(`SKU ${sku} matched but couldn't fill qty (${result.reason}).`, 'warn');
-            }
+        const result = await pickUomInDialog(dialog, desiredUom);
+        if (!result.ok) { closeDialogIfOpen(dialog); return result; }
 
-            await sleep(CONFIG.ROW_PROCESS_DELAY_MS);
+        // Wait for the dialog to actually close
+        await waitFor(() => !isVisible(dialog), CONFIG.DIALOG_CLOSE_TIMEOUT_MS, CONFIG.POLL_FAST_MS);
+        await sleep(300);
+
+        // Reconnect + restore scroll position
+        ensureGridDoc();
+        resolveColumnIds();
+        const vpAfter = getGridViewport();
+        if (vpAfter && savedScrollTop !== null) {
+            vpAfter.scrollTop = savedScrollTop;
+            try { vpAfter.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+            await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
         }
 
-        if (filled > 0) {
-            log(`Batch: filled ${filled}, skipped ${skipped}, unmatched ${unmatched}.`, 'ok');
-        }
+        // Re-locate the row and confirm the UOM stuck
+        let relocated = findRowBySku(sku) || await locateRowWithScrolling(sku);
+        if (!relocated) return { ok: false, reason: 'row disappeared after UOM refresh' };
 
-        return { filledSkus, foundButFailedSkus, newRowsFound: atLeastOneNewRow };
+        const check = readUomMismatch(relocated, desiredUom);
+        if (check.gridUom !== desiredUom) {
+            return { ok: false, reason: `Req UOM still reads "${check.gridUom}"` };
+        }
+        return { ok: true };
     }
 
     // ============================================================
-    // SCROLLING: keep scrolling the ag-grid viewport until we reach
-    // the bottom or every SKU has been filled.
+    // QUANTITY EDIT (single row; retries internally)
     // ============================================================
-    function getGridViewport() {
-        const doc = ensureGridDoc();
-        if (!doc) return null;
-        // ag-grid classic DOM: the viewport is usually .ag-body-viewport
-        let vp = doc.querySelector(CONFIG.GRID_VIEWPORT_SELECTOR);
-        if (!vp) {
-            // Fallback: the scrollable parent of the row container
-            const container = doc.querySelector(CONFIG.ROW_CONTAINER_SELECTOR);
-            if (container) vp = container.closest('.ag-body-viewport, .ag-center-cols-viewport, .ag-body-horizontal-scroll-viewport') || container.parentElement;
-        }
-        return vp;
+
+    function readQuantityFromRow(row) {
+        const cell = getQtyCellFromRow(row);
+        if (!cell) return '';
+        const input = cell.querySelector('input, textarea');
+        return normalizeQty(input ? input.value : cell.textContent);
     }
 
-    async function scrollGridDown() {
-        const vp = getGridViewport();
-        if (!vp) return { didScroll: false, scrollTop: 0, scrollHeight: 0, clientHeight: 0 };
+    async function verifyQuantity(sku, wanted) {
+        return !!(await waitFor(() => {
+            const row = findRowBySku(sku);
+            if (!row) return false;
+            return qtyMatches(readQuantityFromRow(row), wanted);
+        }, CONFIG.VERIFY_TIMEOUT_MS, CONFIG.POLL_FAST_MS));
+    }
 
-        const before = vp.scrollTop;
-        vp.scrollTop += CONFIG.SCROLL_AMOUNT_PX;
+    async function editRowQuantity(sku, valueStr) {
+        const wanted = normalizeQty(valueStr);
+
+        for (let attempt = 1; attempt <= CONFIG.QTY_EDIT_RETRY_ATTEMPTS; attempt++) {
+            if (aborted) return { ok: false, reason: 'stopped by user' };
+
+            const doc = ensureGridDoc();
+            if (!doc) { await sleep(300); continue; }
+            resolveColumnIds();
+
+            let row = findRowBySku(sku) || await locateRowWithScrolling(sku);
+            if (!row) return { ok: false, reason: 'SKU row not available' };
+
+            await ensureCellVisible(row, getQtyCellFromRow);
+
+            let qtyCell = getQtyCellFromRow(row);
+            if (!qtyCell) { await sleep(200); continue; }
+
+            const rowIndex = row.getAttribute('row-index');
+            const beforeInputs = new Set(doc.querySelectorAll('input, textarea'));
+
+            clickEl(qtyCell);
+
+            const editor = await waitFor(() => {
+                if (rowIndex !== null && rowIndex !== undefined) {
+                    const byId = doc.getElementById(`${CONFIG.QTY_INPUT_ID_PREFIX}${rowIndex}`);
+                    if (byId && isVisible(byId)) return byId;
+                }
+                const cellNow = getQtyCellFromRow(findRowBySku(sku) || row);
+                if (cellNow) {
+                    const inside = cellNow.querySelector('input, textarea');
+                    if (inside && isVisible(inside)) return inside;
+                }
+                const qtyInputs = Array.from(doc.querySelectorAll(
+                    `input[id^="${CONFIG.QTY_INPUT_ID_PREFIX}"], textarea[id^="${CONFIG.QTY_INPUT_ID_PREFIX}"]`));
+                const fresh = qtyInputs.find(el => !beforeInputs.has(el) && isVisible(el));
+                if (fresh) return fresh;
+                const all = Array.from(doc.querySelectorAll('input, textarea'));
+                return all.find(el => !beforeInputs.has(el) && isVisible(el)) || null;
+            }, CONFIG.EDITOR_WAIT_TIMEOUT_MS, CONFIG.POLL_FAST_MS);
+
+            if (!editor) {
+                log(`SKU ${sku}: quantity editor did not appear (attempt ${attempt}).`, 'warn');
+                await sleep(250);
+                continue;
+            }
+
+            try { editor.focus({ preventScroll: true }); } catch (_) {}
+            setNativeValue(editor, wanted);
+            await sleep(80);
+            pressEnter(editor);
+            try { editor.blur(); } catch (_) {}
+            try { editor.dispatchEvent(new Event('blur', { bubbles: true })); } catch (_) {}
+
+            if (await verifyQuantity(sku, wanted)) {
+                return { ok: true };
+            }
+
+            log(`SKU ${sku}: quantity did not stick (attempt ${attempt}/${CONFIG.QTY_EDIT_RETRY_ATTEMPTS}).`, 'warn');
+            await sleep(250);
+        }
+
+        return { ok: false, reason: 'quantity did not stick after retries' };
+    }
+
+    // ============================================================
+    // ONE ROW, END TO END  (the heart of v4: strictly sequential)
+    // ============================================================
+
+    async function processOneRow(sku, item, done) {
+        // 1. Locate the row (rendered, or scroll to it)
+        let row = findRowBySku(sku) || await locateRowWithScrolling(sku);
+        if (!row) {
+            // Not available right now — do NOT mark failed; leave it in
+            // the remaining pool so the recovery sweep finds it later.
+            log(`SKU ${sku}: not rendered yet — deferring to recovery sweep.`, 'info');
+            return;
+        }
+
+        // 2. UOM check / correction
+        const uomCheck = readUomMismatch(row, item.uom);
+        if (uomCheck.mismatch) {
+            log(`SKU ${sku}: Req UOM "${uomCheck.gridUom}" vs "${item.uom}" — correcting...`, 'warn');
+            let correction;
+            try {
+                correction = await correctReqUom(sku, item.uom);
+            } catch (err) {
+                correction = { ok: false, reason: err && err.message ? err.message : String(err) };
+            }
+            ensureGridDoc();
+            resolveColumnIds();
+            row = findRowBySku(sku) || await locateRowWithScrolling(sku);
+            if (row) {
+                markUomResult(row, item.uom, !!(correction && correction.ok));
+            }
+            log(correction && correction.ok
+                ? `SKU ${sku}: Req UOM corrected to "${item.uom}".`
+                : `SKU ${sku}: UOM correction failed — ${correction ? correction.reason : 'unknown'}.`,
+                correction && correction.ok ? 'ok' : 'warn');
+        } else {
+            clearUomMarkers(row);
+            clearUomMarkerState(sku);
+        }
+
+        if (aborted) return;
+
+        // 3. Quantity
+        const qtyStr = CONFIG.formatQty(item.qty);
+        const qtyResult = await editRowQuantity(sku, qtyStr);
+        if (qtyResult.ok) {
+            done.filled.add(sku);
+            log(`SKU ${sku} -> quantity ${qtyStr}`, 'ok');
+        } else {
+            done.failed.add(sku);
+            log(`SKU ${sku}: quantity failed — ${qtyResult.reason}`, 'warn');
+        }
+    }
+
+    // ============================================================
+    // MAIN SCAN LOOP
+    //
+    // Walks the grid top -> bottom. Every rendered row that matches
+    // an unprocessed SKU is completed fully before moving on.
+    // At the bottom, any SKUs still pending get RECOVERY_PASSES
+    // additional full top -> bottom sweeps before being reported.
+    // ============================================================
+
+    async function processAllRows(dataMap, skuList) {
+        const done = { filled: new Set(), failed: new Set() };
+
+        await scrollViewportTo(0);
         await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
 
-        const after = vp.scrollTop;
-        const atBottom = (vp.scrollTop + vp.clientHeight) >= (vp.scrollHeight - 5); // 5px tolerance
-
-        return {
-            didScroll: after !== before,
-            scrollTop: after,
-            scrollHeight: vp.scrollHeight,
-            clientHeight: vp.clientHeight,
-            atBottom
-        };
-    }
-
-    function describeSku(sku, dataMap) {
-        const desc = dataMap[sku] && dataMap[sku].description;
-        return desc ? `${sku} (${desc})` : sku;
-    }
-
-    function reportMissingSkus(dataMap, filledSkus, foundButFailedSkus) {
-        const allSkus = Object.keys(dataMap);
-        const neverFound = allSkus.filter(s => !filledSkus.has(s) && !foundButFailedSkus.has(s));
-        const failedEdit = allSkus.filter(s => foundButFailedSkus.has(s));
-        const missing = [...neverFound, ...failedEdit];
-
-        if (missing.length === 0) {
-            log(`All ${allSkus.length} pasted item(s) were filled successfully.`, 'ok');
-            return;
-        }
-
-        const lines = [];
-        if (neverFound.length > 0) {
-            lines.push(`Not found in the filtered grid (${neverFound.length}):`);
-            neverFound.forEach(s => lines.push('  • ' + describeSku(s, dataMap)));
-        }
-        if (failedEdit.length > 0) {
-            lines.push(`Found but quantity couldn't be entered (${failedEdit.length}):`);
-            failedEdit.forEach(s => lines.push('  • ' + describeSku(s, dataMap)));
-        }
-
-        log(`${missing.length} of ${allSkus.length} pasted item(s) were NOT filled — see below.`, 'err');
-        missing.forEach(s => log('Missing: ' + describeSku(s, dataMap), 'err'));
-
-        alert(`${missing.length} item(s) were NOT filled in:\n\n${lines.join('\n')}`);
-    }
-
-    // ============================================================
-    // Main run
-    // ============================================================
-    document.getElementById('reqFillerGenerate').addEventListener('click', async () => {
-        clearLog();
-        gridDoc = null; // force a fresh search each run, in case the frame reloaded
-
-        const raw = document.getElementById('reqFillerInput').value;
-        const parsed = parseInput(raw);
-
-        if (parsed.length === 0) {
-            log('No valid rows parsed. Check that you pasted SKU / Desc / Qty / UOM rows (tab- or multi-space-separated).', 'err');
-            return;
-        }
-
-        log(`Parsed ${parsed.length} row(s).`, 'ok');
-
-        if (!ensureGridDoc()) return;
-        resolveColumnIds();
-
-        const dataMap = {};
-        const skuList = [];
-        for (const r of parsed) {
-            dataMap[r.sku] = { qty: r.qty, description: r.description, uom: r.uom };
-            skuList.push(r.sku);
-        }
-
-        log('Opening the Part # filter...');
-        await openPartNumberFilter();
-
-        const filterOk = await fillFilterAndApply(skuList);
-        if (!filterOk) return;
-
-        log(`Waiting ${CONFIG.FILTER_APPLY_DELAY_MS}ms for the grid to refresh...`);
-        await sleep(CONFIG.FILTER_APPLY_DELAY_MS);
-
-        // ========================================================
-        // SCROLL & FILL LOOP (each batch processes rows top-to-bottom)
-        // ========================================================
-        const totalFilledSkus = new Set();
-        const totalFailedSkus = new Set();
+        let recoveryPass = 0;
         let iterations = 0;
-        let stagnantIterations = 0;
 
         while (iterations < CONFIG.MAX_SCROLL_ITERATIONS) {
+            if (aborted) break;
             iterations++;
 
-            const { filledSkus, foundButFailedSkus, newRowsFound } = await fillQuantities(dataMap, totalFilledSkus);
+            ensureGridDoc();
+            resolveColumnIds();
 
-            filledSkus.forEach(s => totalFilledSkus.add(s));
-            foundButFailedSkus.forEach(s => totalFailedSkus.add(s));
+            const rows = getGridRows();
+            for (const row of rows) {
+                if (aborted) break;
+                const sku = getSkuFromRow(row);
+                if (!sku || !dataMap[sku]) continue;
+                if (done.filled.has(sku) || done.failed.has(sku)) continue;
+                await processOneRow(sku, dataMap[sku], done);
+                await sleep(CONFIG.ROW_TO_ROW_DELAY_MS);
+            }
 
-            const remaining = skuList.filter(s => !totalFilledSkus.has(s) && !totalFailedSkus.has(s));
+            const remaining = skuList.filter(s => !done.filled.has(s) && !done.failed.has(s));
             if (remaining.length === 0) {
-                log('All SKUs have been processed.', 'ok');
+                log('All pasted SKUs processed.', 'ok');
                 break;
             }
+            if (aborted) break;
 
-            // Try to scroll down and load more virtual rows
-            const scrollResult = await scrollGridDown();
+            const vp = getGridViewport();
+            const atBottom = !vp || vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 5;
 
-            if (!scrollResult.didScroll && scrollResult.atBottom) {
-                log('Reached the bottom of the grid.', 'ok');
-                break;
-            }
-
-            if (!newRowsFound && !scrollResult.didScroll) {
-                stagnantIterations++;
-                if (stagnantIterations >= 3) {
-                    log('No new rows appearing after multiple scroll attempts — stopping.', 'warn');
-                    break;
+            if (atBottom) {
+                if (recoveryPass < CONFIG.RECOVERY_PASSES) {
+                    recoveryPass++;
+                    log(`Bottom reached with ${remaining.length} pending — recovery sweep ${recoveryPass}/${CONFIG.RECOVERY_PASSES} from top...`, 'warn');
+                    await scrollViewportTo(0);
+                    await sleep(CONFIG.SCROLL_RENDER_DELAY_MS);
+                    continue;
                 }
-            } else {
-                stagnantIterations = 0;
+                log(`Finished. ${remaining.length} SKU(s) could not be located after all sweeps.`, 'warn');
+                break;
             }
 
-            log(`Scrolled down (${iterations}). Remaining SKUs: ${remaining.length}.`);
+            await scrollViewportBy(Math.max(200, (vp ? vp.clientHeight : 400) - 60));
         }
 
-        if (iterations >= CONFIG.MAX_SCROLL_ITERATIONS) {
-            log('Stopped: reached maximum scroll iterations.', 'warn');
+        return done;
+    }
+
+    // ============================================================
+    // FILTER
+    // ============================================================
+
+    function findVisibleFilterInput() {
+        const doc = ensureGridDoc();
+        if (!doc) return null;
+        return Array.from(doc.querySelectorAll(CONFIG.FILTER_INPUT_SELECTOR)).find(input =>
+            isVisible(input) &&
+            (!CONFIG.FILTER_INPUT_PLACEHOLDER || input.placeholder === CONFIG.FILTER_INPUT_PLACEHOLDER)
+        ) || null;
+    }
+
+    function findVisibleApplyButton() {
+        const doc = ensureGridDoc();
+        if (!doc) return null;
+        const candidates = Array.from(doc.querySelectorAll(CONFIG.APPLY_BUTTON_SELECTOR));
+        let btn = candidates.find(el => isVisible(el) && /^apply filter$/i.test(el.textContent.trim()));
+        if (!btn) {
+            btn = Array.from(doc.querySelectorAll('button')).find(b =>
+                isVisible(b) && /apply filter/i.test(b.textContent));
+        }
+        return btn || null;
+    }
+
+    async function openPartNumberFilter() {
+        const doc = ensureGridDoc();
+        if (!doc) return false;
+        const { skuColId } = resolveColumnIds();
+        const header = doc.querySelector(`.ag-header-cell[col-id="${skuColId}"]`);
+        if (!header) { log('Could not find Part # header.', 'err'); return false; }
+
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            const menuBtn = header.querySelector('[ref="eMenu"], .ag-header-cell-menu-button');
+            if (!menuBtn) { log('Part # filter/menu button not found.', 'warn'); return false; }
+            dispatchRealisticClick(menuBtn);
+            if (await waitFor(findVisibleFilterInput, 800, CONFIG.POLL_FAST_MS)) {
+                log('Part # filter panel is open.', 'ok');
+                return true;
+            }
+            // Some builds open a menu first — click the Filter tab in it
+            const popup = doc.querySelector('.ag-popup:not(.ag-hidden) .ag-menu, .ag-popup .ag-menu');
+            if (popup) {
+                const filterIcon = popup.querySelector(
+                    '.ag-tab-selector .ag-icon-filter, .ag-menu-header .ag-icon-filter, [aria-label="Filter"]');
+                if (filterIcon) {
+                    const clickable = filterIcon.closest('span, button, div');
+                    if (clickable) {
+                        dispatchRealisticClick(clickable);
+                        if (await waitFor(findVisibleFilterInput, 800, CONFIG.POLL_FAST_MS)) {
+                            log('Part # filter panel is open.', 'ok');
+                            return true;
+                        }
+                    }
+                }
+            }
+            await sleep(300);
+        }
+        log('Could not open the Part # filter popup.', 'err');
+        return false;
+    }
+
+    async function fillFilterAndApply(skuList) {
+        let input = findVisibleFilterInput();
+        if (!input) { await openPartNumberFilter(); input = findVisibleFilterInput(); }
+        if (!input) { log('Filter input not found.', 'err'); return false; }
+
+        setNativeValue(input, skuList.join(','));
+        log(`Filter filled with ${skuList.length} SKU(s).`, 'ok');
+        await sleep(120);
+
+        const applyBtn = findVisibleApplyButton();
+        if (!applyBtn) { log('Apply Filter button not found.', 'err'); return false; }
+        clickEl(applyBtn);
+        log('Clicked Apply Filter.', 'ok');
+        return true;
+    }
+
+    // ============================================================
+    // PARSE INPUT
+    // ============================================================
+
+    function parseInput(raw) {
+        const lines = String(raw || '').split(/\r?\n/);
+        const rows = [];
+        for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (!line) continue;
+            let cols = line.split('\t').map(c => c.trim());
+            if (cols.length < 4) cols = line.split(/\s{2,}/).map(c => c.trim());
+            if (cols.length < 4) continue;
+            const skuRaw = cols[0], descRaw = cols[1] || '',
+                  qtyRaw = cols[2] || '', uomRaw = cols[3] || '';
+            if (/^item\s*sku$/i.test(skuRaw)) continue;
+            const sku = normalizeSku(skuRaw);
+            if (!sku) continue;
+            const qtyNum = parseFloat(qtyRaw.replace(/,/g, ''));
+            if (Number.isNaN(qtyNum)) continue;
+            rows.push({ sku, qty: qtyNum, description: descRaw.trim(), uom: normalizeUom(uomRaw) });
+        }
+        return rows;
+    }
+
+    // ============================================================
+    // REPORT
+    // ============================================================
+
+    function describeSku(sku, dataMap) {
+        const d = dataMap[sku] && dataMap[sku].description;
+        return d ? `${sku} (${d})` : sku;
+    }
+
+    function reportResults(dataMap, skuList, done) {
+        const notFound = skuList.filter(s => !done.filled.has(s) && !done.failed.has(s));
+        const failedEdit = skuList.filter(s => done.failed.has(s));
+
+        if (notFound.length === 0 && failedEdit.length === 0) {
+            log(`SUCCESS: all ${skuList.length} item(s) filled.`, 'ok');
+            alert(`SUCCESS\n\nAll ${skuList.length} item(s) were filled successfully.`);
+            return;
         }
 
-        reportMissingSkus(dataMap, totalFilledSkus, totalFailedSkus);
+        log(`${notFound.length + failedEdit.length} of ${skuList.length} item(s) were NOT filled.`, 'err');
+
+        const lines = [];
+        if (notFound.length > 0) {
+            log(`Not found in grid (${notFound.length}):`, 'err');
+            lines.push(`Not found (${notFound.length}):`);
+            notFound.forEach(sku => { log(`Missing: ${describeSku(sku, dataMap)}`, 'err'); lines.push(`  - ${describeSku(sku, dataMap)}`); });
+        }
+        if (failedEdit.length > 0) {
+            log(`Found but quantity failed (${failedEdit.length}):`, 'err');
+            lines.push(`Quantity failed (${failedEdit.length}):`);
+            failedEdit.forEach(sku => { log(`Failed: ${describeSku(sku, dataMap)}`, 'err'); lines.push(`  - ${describeSku(sku, dataMap)}`); });
+        }
+
+        alert(`${notFound.length + failedEdit.length} item(s) were NOT filled.\n\n` + lines.join('\n'));
+    }
+
+    // ============================================================
+    // MAIN
+    // ============================================================
+
+    document.getElementById('reqFillerGenerate').addEventListener('click', async () => {
+        const button = document.getElementById('reqFillerGenerate');
+        const stopBtn = document.getElementById('reqFillerStop');
+        button.disabled = true;
+        button.textContent = 'Running...';
+        stopBtn.style.display = 'block';
+        aborted = false;
+
+        try {
+            clearLog();
+            const raw = document.getElementById('reqFillerInput').value;
+            const parsed = parseInput(raw);
+            if (parsed.length === 0) {
+                log('No valid rows found. Expected: SKU / Description / Qty / UOM.', 'err');
+                return;
+            }
+            log(`Parsed ${parsed.length} row(s). Processing strictly one-by-one.`, 'ok');
+
+            const dataMap = Object.create(null);
+            const skuList = [];
+            for (const item of parsed) {
+                dataMap[item.sku] = { qty: item.qty, description: item.description, uom: item.uom };
+                if (!skuList.includes(item.sku)) skuList.push(item.sku);
+            }
+
+            log('Locating current BirchStreet Order Sheet...', 'info');
+            if (!ensureGridDoc()) {
+                log('Order Sheet grid not found. Open the Order Sheet and try again.', 'err');
+                return;
+            }
+            resolveColumnIds();
+
+            log('Opening Part # filter...', 'info');
+            if (!(await openPartNumberFilter())) return;
+            if (!(await fillFilterAndApply(skuList))) return;
+
+            log('Waiting for the filtered grid to refresh...', 'info');
+            await sleep(CONFIG.FILTER_APPLY_SETTLE_MS);
+            ensureGridDoc();
+            resolveColumnIds();
+
+            const t0 = Date.now();
+            const result = await processAllRows(dataMap, skuList);
+            const secs = ((Date.now() - t0) / 1000).toFixed(1);
+            log(`Done in ${secs}s — ${result.filled.size} filled, ${result.failed.size} failed.`, 'info');
+
+            reportResults(dataMap, skuList, result);
+
+        } catch (error) {
+            console.error('[REQ Filler v4]', error);
+            log(`Unexpected error: ${error && error.message ? error.message : String(error)}`, 'err');
+            alert('REQ Filler encountered an unexpected error.\n\n' +
+                (error && error.message ? error.message : String(error)));
+        } finally {
+            button.disabled = false;
+            button.textContent = 'Generate';
+            stopBtn.style.display = 'none';
+        }
     });
 
-    console.log('[REQ SKU/Qty Filler v2.2] loaded.');
+    console.log('[REQ SKU/Qty Filler v4.0] loaded (host: ' +
+        (window.name === ORDER_SHEET_FRAME_NAME ? 'OrderSheetTab' : 'standalone Order Sheet page') + ').');
 })();
